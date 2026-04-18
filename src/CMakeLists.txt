@@ -93,6 +93,7 @@ set(FVDB_CU_FILES
     fvdb/detail/ops/CoarseIjkForFineGrid.cu
     fvdb/detail/ops/convolution/GatherScatterDefault.cu
     fvdb/detail/ops/convolution/PredGatherIGemm.cu
+    fvdb/detail/ops/convolution/StencilConv.cu
     fvdb/detail/ops/CoordsInGrid.cu
     fvdb/detail/ops/CubesInGrid.cu
     fvdb/detail/ops/DownsampleGridAvgPool.cu

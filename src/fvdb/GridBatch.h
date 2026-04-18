@@ -9,6 +9,7 @@
 #include <fvdb/detail/GridBatchImpl.h>
 #include <fvdb/detail/ops/convolution/GatherScatterDefault.h>
 #include <fvdb/detail/ops/convolution/PredGatherIGemm.h>
+#include <fvdb/detail/ops/convolution/StencilConv.h>
 #include <fvdb/detail/utils/Utils.h>
 
 #include <nanovdb/NanoVDB.h>
@@ -858,6 +859,19 @@ struct GridBatch : torch::CustomClassHolder {
                                              const GridBatch &output_grid,
                                              int kernel_size,
                                              int stride);
+
+    // ---- StencilConv convolution (CTA-per-leaf, smem halo, scalar R=1) ----
+
+    /// @brief Forward pass of scalar stencil sparse convolution.
+    /// @param features     Input features, shape [N_in] or [N_in, 1], float32.
+    /// @param weights      Kernel weights, shape [1, 1, 3, 3, 3], float32.
+    /// @param source_grid  Grid batch for input voxels.
+    /// @param target_grid  Grid batch for output voxels.
+    /// @return Output features, shape [N_out, 1], float32.
+    static torch::Tensor stencilConv(torch::Tensor features,
+                                     torch::Tensor weights,
+                                     const GridBatch &source_grid,
+                                     const GridBatch &target_grid);
 
     /// @brief Perform one integration step of the TSDF fusion algorithm on a batch of sparse grids.
     ///        The TSDF fusion algorithm integrates depth and feature images (e.g. colors)

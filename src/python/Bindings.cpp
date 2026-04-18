@@ -525,6 +525,24 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("output_grid"),
         py::arg("kernel_size"),
         py::arg("stride"));
+
+    // -----------------------------------------------------------------------
+    // StencilConv: CTA-per-leaf scalar stencil convolution (forward only)
+    // -----------------------------------------------------------------------
+
+    m.def(
+        "stencil_conv",
+        [](torch::Tensor features,
+           torch::Tensor weights,
+           const fvdb::GridBatch &source_grid,
+           const fvdb::GridBatch &target_grid) -> torch::Tensor {
+            return fvdb::GridBatch::stencilConv(features, weights, source_grid, target_grid);
+        },
+        "StencilConv forward sparse convolution (CTA-per-leaf, smem halo, scalar R=1).",
+        py::arg("features"),
+        py::arg("weights"),
+        py::arg("source_grid"),
+        py::arg("target_grid"));
 }
 
 TORCH_LIBRARY(fvdb, m) {

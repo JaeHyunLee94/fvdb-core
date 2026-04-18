@@ -95,6 +95,31 @@ class _PredGatherIGemmConvFn(torch.autograd.Function):
         return grad_feat, grad_w, None, None, None, None, None
 
 
+class _StencilConvFn(torch.autograd.Function):
+    """Autograd wrapper for the StencilConv CTA-per-leaf scalar stencil kernel.
+
+    Forward only; backward raises NotImplementedError. Use the gather_scatter
+    backend if gradients are required.
+    """
+
+    @staticmethod
+    def forward(  # type: ignore[override]
+        ctx,
+        features: torch.Tensor,
+        weights: torch.Tensor,
+        source_grid: _fvdb_cpp.GridBatch,
+        target_grid: _fvdb_cpp.GridBatch,
+    ) -> torch.Tensor:
+        return _fvdb_cpp.stencil_conv(features, weights, source_grid, target_grid)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[None, None, None, None]:  # type: ignore[override]
+        raise NotImplementedError(
+            "StencilConv backend does not support backward. "
+            "Use 'gather_scatter' backend if gradients are required."
+        )
+
+
 # ============================================================
 #  Backend data classes — cached precomputed data per method
 # ============================================================
@@ -133,7 +158,24 @@ class _PredGatherIGemmBackend:
     stride: int
 
 
-_Backend = _MatmulBackend | _DenseBackend | _GatherScatterBackend | _PredGatherIGemmBackend
+@dataclass(frozen=True)
+class _StencilConvBackend:
+    """Stencil convolution: CTA-per-leaf, smem halo staging, scalar only, stride 1.
+
+    Stateless — no precomputed topology. The kernel receives source/target
+    grid data and features at execute time.
+    """
+
+    pass
+
+
+_Backend = (
+    _MatmulBackend
+    | _DenseBackend
+    | _GatherScatterBackend
+    | _PredGatherIGemmBackend
+    | _StencilConvBackend
+)
 
 
 @dataclass(frozen=True)
@@ -662,6 +704,24 @@ class ConvolutionPlan:
                 raise ValueError("PredGatherIGemm convolution returned non-tensor")
             result = self._target_grid.jagged_like(out_tensor)
 
+        elif isinstance(backend, _StencilConvBackend):
+            if in_c != 1 or out_c != 1:
+                raise ValueError(
+                    f"StencilConv backend requires in_channels=1 and out_channels=1, "
+                    f"got ({in_c}, {out_c})."
+                )
+            out_tensor = _StencilConvFn.apply(
+                data.jdata,
+                weights,
+                self._source_grid._impl,
+                self._target_grid._impl,
+            )
+            if out_tensor is None:
+                raise ValueError("StencilConv convolution returned None")
+            if not isinstance(out_tensor, torch.Tensor):
+                raise ValueError("StencilConv convolution returned non-tensor")
+            result = self._target_grid.jagged_like(out_tensor)
+
         else:
             raise TypeError(f"Unknown backend type: {type(backend)}")
 
@@ -781,6 +841,22 @@ class ConvolutionPlan:
             else:
                 topo = _fvdb_cpp.gs_build_topology(source_grid._impl, target_grid._impl, kernel_size, stride)
             return _GatherScatterBackend(topology=topo)
+
+        # StencilConv — CTA-per-leaf scalar stencil (forward only, stride 1, R=1)
+        if backend_name == "stencil":
+            if transposed:
+                raise ValueError("StencilConv backend does not support transposed convolution.")
+            if not _vec_is_all(stride, 1):
+                raise ValueError("StencilConv backend requires stride 1.")
+            if not _vec_is_all(kernel_size, 3):
+                raise ValueError("StencilConv backend requires kernel_size 3x3x3.")
+            for cin, cout in channel_pairs:
+                if cin != 1 or cout != 1:
+                    raise ValueError(
+                        f"StencilConv backend requires in_channels=1 and out_channels=1, "
+                        f"got ({cin}, {cout})."
+                    )
+            return _StencilConvBackend()
 
         # PredGatherIGemm — CUTLASS IGEMM on SM80+, forward only
         if backend_name == "pred_gather_igemm":

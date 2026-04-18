@@ -1210,4 +1210,13 @@ GridBatch::predGatherIGemmConv(torch::Tensor features,
         features, weights, *feature_grid.mImpl, *output_grid.mImpl, kernel_size, stride);
 }
 
+torch::Tensor
+GridBatch::stencilConv(torch::Tensor features,
+                       torch::Tensor weights,
+                       const GridBatch &source_grid,
+                       const GridBatch &target_grid) {
+    return detail::ops::stencilSparseConv(
+        features, weights, *source_grid.mImpl, *target_grid.mImpl);
+}
+
 } // namespace fvdb

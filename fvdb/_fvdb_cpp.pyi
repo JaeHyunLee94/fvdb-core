@@ -102,6 +102,14 @@ def pred_gather_igemm_conv(
     stride: int,
 ) -> torch.Tensor: ...
 
+# StencilConv: CTA-per-leaf scalar stencil convolution (forward only, R=1, stride 1)
+def stencil_conv(
+    features: torch.Tensor,
+    weights: torch.Tensor,
+    source_grid: GridBatch,
+    target_grid: GridBatch,
+) -> torch.Tensor: ...
+
 class GaussianSplat3d:
     class ProjectionType(Enum):
         PERSPECTIVE = ...
