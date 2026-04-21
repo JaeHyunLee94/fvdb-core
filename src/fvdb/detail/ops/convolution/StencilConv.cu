@@ -54,7 +54,7 @@ stencilConvKernel(const float *__restrict__ inputFeatures,
     // 512 threads fill 1000 slots in two passes.  Pass 1 covers slots 0-511;
     // pass 2 covers slots 512-999 and only the first 488 threads participate.
     // ------------------------------------------------------------------
-    auto srcAcc = sourceGrid->getAccessor();
+    const auto &srcTree = sourceGrid->tree();
 
     #pragma unroll
     for (int pass = 0; pass < 2; ++pass) {
@@ -64,7 +64,7 @@ stencilConvKernel(const float *__restrict__ inputFeatures,
             const int          j = (s / kHaloSize) % kHaloSize;
             const int          k = s % kHaloSize;
             const nanovdb::Coord ijk(Lx + i - 1, Ly + j - 1, Lz + k - 1);
-            const uint64_t     raw = srcAcc.getValue(ijk);
+            const uint64_t     raw = srcTree.getValue(ijk);
             haloValues[i][j][k]    = raw ? inputFeatures[raw - 1] : 0.0f;
         }
     }
@@ -79,8 +79,7 @@ stencilConvKernel(const float *__restrict__ inputFeatures,
     const int lk = tid & 0x7;
 
     const nanovdb::Coord outIJK(Lx + li, Ly + lj, Lz + lk);
-    auto                 tgtAcc = targetGrid->getAccessor();
-    const int64_t        outIdx = static_cast<int64_t>(tgtAcc.getValue(outIJK)) - 1;
+    const int64_t        outIdx = static_cast<int64_t>(targetGrid->tree().getValue(outIJK)) - 1;
     if (outIdx < 0) {
         return;
     }
