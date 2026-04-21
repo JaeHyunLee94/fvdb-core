@@ -35,6 +35,7 @@ from fvdb import ConvolutionPlan, JaggedTensor
 # =============================================================================
 
 STENCIL_CONFIG: dict = {"backend": "stencil"}
+STENCIL_LAPLACE7_CONFIG: dict = {"backend": "stencil", "stencil": "laplace7"}
 GS_CONFIG: dict = {"backend": "gather_scatter"}
 
 # Scalar fp32 — strict tolerance since both backends do the same accumulation
@@ -242,6 +243,150 @@ class TestConvStencil(unittest.TestCase):
         weights = torch.randn((4, 4, 3, 3, 3), device=self.DEVICE, dtype=self.DTYPE)
         with self.assertRaises(ValueError):
             plan.execute(features, weights)
+
+    # -------------------------------------------------------------------------
+    # Laplace7 specialization
+    # -------------------------------------------------------------------------
+
+    LAPLACE7_ON_STENCIL = [
+        (1, 1, 1),
+        (0, 1, 1), (2, 1, 1),
+        (1, 0, 1), (1, 2, 1),
+        (1, 1, 0), (1, 1, 2),
+    ]
+
+    def _make_laplace7_weights(self) -> torch.Tensor:
+        """Build a strict 7-point Laplacian weight tensor (off-stencil exactly 0)."""
+        w = torch.zeros((1, 1, 3, 3, 3), device=self.DEVICE, dtype=self.DTYPE)
+        w[0, 0, 1, 1, 1] = -6.0
+        for i, j, k in self.LAPLACE7_ON_STENCIL[1:]:
+            w[0, 0, i, j, k] = 1.0
+        return w
+
+    def _make_random_laplace7_weights(self) -> torch.Tensor:
+        """Random on-stencil values, off-stencil positions exactly 0."""
+        w = torch.zeros((1, 1, 3, 3, 3), device=self.DEVICE, dtype=self.DTYPE)
+        for i, j, k in self.LAPLACE7_ON_STENCIL:
+            w[0, 0, i, j, k] = torch.randn((), device=self.DEVICE, dtype=self.DTYPE)
+        return w
+
+    def test_laplace7_matches_dense27_standard_laplacian(self):
+        """Laplace7 kernel with classical [-6, 1, 1, 1, 1, 1, 1] coefficients matches Dense27."""
+        cluster = get_cluster_edge_aligned(self.KERNEL_SIZE, self.DEVICE)
+        grid = create_grid_from_coords(cluster, self.DEVICE)
+        dst_grid = grid.conv_grid(kernel_size=self.KERNEL_SIZE, stride=1)
+        n = len(cluster)
+
+        features = JaggedTensor(torch.randn((n, 1), device=self.DEVICE, dtype=self.DTYPE))
+        weights = self._make_laplace7_weights()
+
+        dense_plan = ConvolutionPlan.from_grid_batch(
+            kernel_size=self.KERNEL_SIZE,
+            stride=1,
+            source_grid=grid,
+            target_grid=dst_grid,
+            expert_config=STENCIL_CONFIG,
+        )
+        laplace_plan = ConvolutionPlan.from_grid_batch(
+            kernel_size=self.KERNEL_SIZE,
+            stride=1,
+            source_grid=grid,
+            target_grid=dst_grid,
+            expert_config=STENCIL_LAPLACE7_CONFIG,
+        )
+        dense_out = dense_plan.execute(features, weights)
+        laplace_out = laplace_plan.execute(features, weights)
+
+        # Both kernels compute the same math when only 7 weight positions are nonzero,
+        # so results should be bit-identical.
+        torch.testing.assert_close(laplace_out.jdata, dense_out.jdata, rtol=0.0, atol=0.0)
+
+    def test_laplace7_matches_dense27_random_on_stencil_weights(self):
+        """Laplace7 matches Dense27 for any weight with off-stencil positions zero."""
+        impulse_coords, _ = generate_hermit_impulses_dense(
+            num_candidates=self.NUM_CANDIDATES,
+            volume_shape=self.VOLUME_SHAPE,
+            kernel_size=self.KERNEL_SIZE,
+            impulse_value=1,
+            dtype=self.DTYPE,
+            device=self.DEVICE,
+        )
+        grid = create_grid_from_coords(impulse_coords, self.DEVICE)
+        dst_grid = grid.conv_grid(kernel_size=self.KERNEL_SIZE, stride=1)
+        n = grid.total_voxels
+        features = JaggedTensor(torch.randn((n, 1), device=self.DEVICE, dtype=self.DTYPE))
+        weights = self._make_random_laplace7_weights()
+
+        dense_plan = ConvolutionPlan.from_grid_batch(
+            kernel_size=self.KERNEL_SIZE, stride=1,
+            source_grid=grid, target_grid=dst_grid,
+            expert_config=STENCIL_CONFIG,
+        )
+        laplace_plan = ConvolutionPlan.from_grid_batch(
+            kernel_size=self.KERNEL_SIZE, stride=1,
+            source_grid=grid, target_grid=dst_grid,
+            expert_config=STENCIL_LAPLACE7_CONFIG,
+        )
+        torch.testing.assert_close(
+            laplace_plan.execute(features, weights).jdata,
+            dense_plan.execute(features, weights).jdata,
+            rtol=0.0, atol=0.0,
+        )
+
+    def test_laplace7_matches_gather_scatter(self):
+        """Laplace7 result equals gather_scatter on a pure 7-point Laplacian."""
+        cluster = get_cluster_edge_aligned(self.KERNEL_SIZE, self.DEVICE)
+        grid = create_grid_from_coords(cluster, self.DEVICE)
+        dst_grid = grid.conv_grid(kernel_size=self.KERNEL_SIZE, stride=1)
+        n = len(cluster)
+
+        features = JaggedTensor(torch.randn((n, 1), device=self.DEVICE, dtype=self.DTYPE))
+        weights = self._make_laplace7_weights()
+
+        laplace_plan = ConvolutionPlan.from_grid_batch(
+            kernel_size=self.KERNEL_SIZE, stride=1,
+            source_grid=grid, target_grid=dst_grid,
+            expert_config=STENCIL_LAPLACE7_CONFIG,
+        )
+        gs_plan = ConvolutionPlan.from_grid_batch(
+            kernel_size=self.KERNEL_SIZE, stride=1,
+            source_grid=grid, target_grid=dst_grid,
+            expert_config=GS_CONFIG,
+        )
+        torch.testing.assert_close(
+            laplace_plan.execute(features, weights).jdata,
+            gs_plan.execute(features, weights).jdata,
+            rtol=RTOL, atol=ATOL,
+        )
+
+    def test_laplace7_rejects_nonzero_off_stencil_weights(self):
+        """Passing weights with nonzero off-stencil positions must raise at execute time."""
+        cluster = get_cluster_edge_aligned(self.KERNEL_SIZE, self.DEVICE)
+        grid = create_grid_from_coords(cluster, self.DEVICE)
+        n = len(cluster)
+
+        plan = ConvolutionPlan.from_grid_batch(
+            kernel_size=self.KERNEL_SIZE, stride=1,
+            source_grid=grid,
+            expert_config=STENCIL_LAPLACE7_CONFIG,
+        )
+        # A fully-random 3x3x3 tensor has nonzero corners/edges, so it should fail.
+        features = JaggedTensor(torch.randn((n, 1), device=self.DEVICE, dtype=self.DTYPE))
+        weights = torch.randn((1, 1, 3, 3, 3), device=self.DEVICE, dtype=self.DTYPE)
+        with self.assertRaises(ValueError) as cm:
+            plan.execute(features, weights)
+        self.assertIn("laplace7", str(cm.exception).lower())
+
+    def test_laplace7_unknown_stencil_name_rejected(self):
+        """expert_config={'stencil': '<unknown>'} is rejected at plan creation."""
+        cluster = get_cluster_edge_aligned(self.KERNEL_SIZE, self.DEVICE)
+        grid = create_grid_from_coords(cluster, self.DEVICE)
+        with self.assertRaises(ValueError):
+            ConvolutionPlan.from_grid_batch(
+                kernel_size=self.KERNEL_SIZE, stride=1,
+                source_grid=grid,
+                expert_config={"backend": "stencil", "stencil": "not_a_real_stencil"},
+            )
 
     # -------------------------------------------------------------------------
     # Correctness — source_grid != target_grid

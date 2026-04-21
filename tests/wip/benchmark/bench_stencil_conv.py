@@ -73,6 +73,9 @@ TOPOLOGIES = {
 
 BACKENDS = {
     "stencil": {"backend": "stencil"},
+    # validate_weights=False skips the per-execute off-stencil-zero check so
+    # the benchmark measures pure kernel time.
+    "laplace7": {"backend": "stencil", "stencil": "laplace7", "validate_weights": False},
     "default": {"backend": "gather_scatter"},
 }
 
@@ -80,6 +83,29 @@ BACKENDS = {
 # =============================================================================
 # Setup + timing
 # =============================================================================
+
+
+LAPLACE7_ON_STENCIL = [
+    (1, 1, 1),
+    (0, 1, 1), (2, 1, 1),
+    (1, 0, 1), (1, 2, 1),
+    (1, 1, 0), (1, 1, 2),
+]
+
+
+def _make_weights_for(backend: str) -> torch.Tensor:
+    """Build a weight tensor valid for the given backend.
+
+    The Laplace7 backend validates that off-stencil positions are zero, so
+    a fully-random tensor would fail its check. We produce a weight tensor
+    with nonzero values only at the 7 Laplacian positions; the Dense27 and
+    gather_scatter paths accept this shape too (the 20 zeroed taps simply
+    don't contribute), so the three backends are timed on identical inputs.
+    """
+    w = torch.zeros((1, 1, 3, 3, 3), device=DEVICE, dtype=DTYPE)
+    for i, j, k in LAPLACE7_ON_STENCIL:
+        w[0, 0, i, j, k] = torch.randn((), device=DEVICE, dtype=DTYPE)
+    return w
 
 
 def build(topology: str, backend: str):
@@ -90,7 +116,7 @@ def build(topology: str, backend: str):
     features = JaggedTensor(
         torch.randn((grid.total_voxels, 1), device=DEVICE, dtype=DTYPE)
     )
-    weights = torch.randn((1, 1, 3, 3, 3), device=DEVICE, dtype=DTYPE)
+    weights = _make_weights_for(backend)
 
     plan = ConvolutionPlan.from_grid_batch(
         kernel_size=KERNEL_SIZE,
@@ -99,7 +125,7 @@ def build(topology: str, backend: str):
         target_grid=dst_grid,
         expert_config=BACKENDS[backend],
     )
-    if backend == "stencil":
+    if backend in ("stencil", "laplace7"):
         assert isinstance(plan._backend, _StencilConvBackend)
 
     return plan, features, weights, grid.total_voxels, dst_grid.total_voxels
@@ -148,9 +174,9 @@ def format_results_table(results: list[dict]) -> str:
     lines = [
         "",
         sep,
-        f"StencilConv vs default backend  —  {torch.cuda.get_device_name(0)}  "
+        f"StencilConv backends  —  {torch.cuda.get_device_name(0)}  "
         f"(peak {A6000_PEAK_GBPS:.0f} GB/s)",
-        "speedup = default_mean / stencil_mean",
+        "speedup = default_mean / backend_mean  (for each stencil backend)",
         sep,
         header,
         sep,
@@ -160,19 +186,16 @@ def format_results_table(results: list[dict]) -> str:
         rows = by_topo.get(topo)
         if not rows:
             continue
-        s_row = rows.get("stencil")
         d_row = rows.get("default")
-        speedup = (d_row["mean_ms"] / s_row["mean_ms"]) if (s_row and d_row) else None
 
-        for backend in ("stencil", "default"):
+        for backend in ("stencil", "laplace7", "default"):
             r = rows.get(backend)
             if r is None:
                 continue
-            speedup_str = (
-                f"{speedup:>{col_widths[7] - 1}.2f}x"
-                if backend == "stencil" and speedup is not None
-                else f"{'-':>{col_widths[7]}}"
-            )
+            if backend != "default" and d_row is not None:
+                speedup_str = f"{d_row['mean_ms'] / r['mean_ms']:>{col_widths[7] - 1}.2f}x"
+            else:
+                speedup_str = f"{'-':>{col_widths[7]}}"
             lines.append(
                 f"{r['topology']:<{col_widths[0]}} "
                 f"{r['backend']:<{col_widths[1]}} "

@@ -19,6 +19,7 @@
 #define FVDB_DETAIL_OPS_CONVOLUTION_STENCILCONV_H
 
 #include <fvdb/detail/GridBatchImpl.h>
+#include <fvdb/detail/ops/convolution/StencilDescriptor.h>
 
 #include <torch/types.h>
 
@@ -32,11 +33,13 @@ namespace ops {
 /// @param weights        Kernel weights, shape [1, 1, 3, 3, 3], float32, on CUDA.
 /// @param sourceGrid     Grid batch for the input (feature) voxels.
 /// @param targetGrid     Grid batch for the output voxels.
+/// @param kind           Compile-time stencil specialization (Dense27 or Laplace7).
 /// @return               Output features, shape [N_out, 1], float32.
 torch::Tensor stencilSparseConv(const torch::Tensor &inputFeatures,
                                 const torch::Tensor &weights,
                                 const GridBatchImpl &sourceGrid,
-                                const GridBatchImpl &targetGrid);
+                                const GridBatchImpl &targetGrid,
+                                StencilKind          kind = StencilKind::Dense27);
 
 } // namespace ops
 } // namespace detail

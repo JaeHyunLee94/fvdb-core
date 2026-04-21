@@ -863,15 +863,18 @@ struct GridBatch : torch::CustomClassHolder {
     // ---- StencilConv convolution (CTA-per-leaf, smem halo, scalar R=1) ----
 
     /// @brief Forward pass of scalar stencil sparse convolution.
-    /// @param features     Input features, shape [N_in] or [N_in, 1], float32.
-    /// @param weights      Kernel weights, shape [1, 1, 3, 3, 3], float32.
-    /// @param source_grid  Grid batch for input voxels.
-    /// @param target_grid  Grid batch for output voxels.
+    /// @param features       Input features, shape [N_in] or [N_in, 1], float32.
+    /// @param weights        Kernel weights, shape [1, 1, 3, 3, 3], float32.
+    /// @param source_grid    Grid batch for input voxels.
+    /// @param target_grid    Grid batch for output voxels.
+    /// @param stencil_kind   Compile-time stencil specialization: 0 = Dense27
+    ///                       (all 27 taps), 1 = Laplace7 (center + 6 face neighbors).
     /// @return Output features, shape [N_out, 1], float32.
     static torch::Tensor stencilConv(torch::Tensor features,
                                      torch::Tensor weights,
                                      const GridBatch &source_grid,
-                                     const GridBatch &target_grid);
+                                     const GridBatch &target_grid,
+                                     int64_t stencil_kind = 0);
 
     /// @brief Perform one integration step of the TSDF fusion algorithm on a batch of sparse grids.
     ///        The TSDF fusion algorithm integrates depth and feature images (e.g. colors)

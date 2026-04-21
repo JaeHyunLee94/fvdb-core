@@ -9,6 +9,7 @@
 // a 27-tap multiply-accumulate for a single active output voxel.
 
 #include <fvdb/detail/ops/convolution/StencilConv.h>
+#include <fvdb/detail/ops/convolution/StencilDescriptor.h>
 
 #include <nanovdb/NanoVDB.h>
 
@@ -17,6 +18,8 @@
 #include <torch/types.h>
 
 #include <cstdint>
+#include <tuple>
+#include <utility>
 
 namespace fvdb {
 namespace detail {
@@ -31,6 +34,41 @@ constexpr int kHaloVoxels = kHaloSize * kHaloSize * kHaloSize;
 constexpr int kLeafVoxels = kLeafSize * kLeafSize * kLeafSize;
 constexpr int kThreads    = kLeafVoxels;
 
+// Fold helper: compile-time unroll over StencilT::Taps.
+template <typename Taps, std::size_t... Is>
+__device__ __forceinline__ float
+sumTapsImpl(const float *__restrict__ weights,
+            const float (&halo)[kHaloSize][kHaloSize][kHaloSize],
+            int li,
+            int lj,
+            int lk,
+            std::index_sequence<Is...>) {
+    float sum = 0.0f;
+    ((sum +=
+      weights[(std::tuple_element_t<Is, Taps>::di + 1) * 9 +
+              (std::tuple_element_t<Is, Taps>::dj + 1) * 3 +
+              (std::tuple_element_t<Is, Taps>::dk + 1)] *
+      halo[li + std::tuple_element_t<Is, Taps>::di + 1]
+          [lj + std::tuple_element_t<Is, Taps>::dj + 1]
+          [lk + std::tuple_element_t<Is, Taps>::dk + 1]),
+     ...);
+    return sum;
+}
+
+template <typename StencilT>
+__device__ __forceinline__ float
+sumTaps(const float *__restrict__ weights,
+        const float (&halo)[kHaloSize][kHaloSize][kHaloSize],
+        int li,
+        int lj,
+        int lk) {
+    using Taps = typename StencilT::Taps;
+    return sumTapsImpl<Taps>(
+        weights, halo, li, lj, lk,
+        std::make_index_sequence<std::tuple_size_v<Taps>>{});
+}
+
+template <typename StencilT>
 __global__ void
 stencilConvKernel(const float *__restrict__ inputFeatures,
                   const float *__restrict__ weights,
@@ -38,7 +76,6 @@ stencilConvKernel(const float *__restrict__ inputFeatures,
                   const nanovdb::NanoGrid<nanovdb::ValueOnIndex> *targetGrid,
                   float *__restrict__ outputFeatures) {
     __shared__ float haloValues[kHaloSize][kHaloSize][kHaloSize];
-    //
 
     const int leafID = blockIdx.x;
     const int tid   = threadIdx.x;
@@ -73,7 +110,6 @@ stencilConvKernel(const float *__restrict__ inputFeatures,
     // ------------------------------------------------------------------
     // Phase 2: per-thread output voxel accumulation.
     // ------------------------------------------------------------------
-    // Changing this to bit shifting?
     const int li = (tid >> 6) & 0x7;
     const int lj = (tid >> 3) & 0x7;
     const int lk = tid & 0x7;
@@ -84,18 +120,7 @@ stencilConvKernel(const float *__restrict__ inputFeatures,
         return;
     }
 
-    float sum = 0.0f;
-    #pragma unroll
-    for (int di = -1; di <= 1; ++di) {
-        #pragma unroll
-        for (int dj = -1; dj <= 1; ++dj) {
-            #pragma unroll
-            for (int dk = -1; dk <= 1; ++dk) {
-                const int woff = (di + 1) * 9 + (dj + 1) * 3 + (dk + 1);
-                sum += weights[woff] * haloValues[li + di + 1][lj + dj + 1][lk + dk + 1];
-            }
-        }
-    }
+    const float sum = sumTaps<StencilT>(weights, haloValues, li, lj, lk);
 
     outputFeatures[outIdx] = sum;
 }
@@ -106,7 +131,8 @@ torch::Tensor
 stencilSparseConv(const torch::Tensor &inputFeatures,
                   const torch::Tensor &weights,
                   const GridBatchImpl &sourceGrid,
-                  const GridBatchImpl &targetGrid) {
+                  const GridBatchImpl &targetGrid,
+                  StencilKind          kind) {
     TORCH_CHECK(inputFeatures.is_cuda(), "inputFeatures must be a CUDA tensor");
     TORCH_CHECK(weights.is_cuda(), "weights must be a CUDA tensor");
     TORCH_CHECK(inputFeatures.scalar_type() == torch::kFloat32,
@@ -169,12 +195,28 @@ stencilSparseConv(const torch::Tensor &inputFeatures,
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    stencilConvKernel<<<numTargetLeaves, kThreads, 0, stream>>>(
-        inputFeatures.data_ptr<float>(),
-        weights.data_ptr<float>(),
-        sourceNanoGrid,
-        targetNanoGrid,
-        output.data_ptr<float>());
+    switch (kind) {
+    case StencilKind::Dense27:
+        stencilConvKernel<Dense27Stencil>
+            <<<numTargetLeaves, kThreads, 0, stream>>>(
+                inputFeatures.data_ptr<float>(),
+                weights.data_ptr<float>(),
+                sourceNanoGrid,
+                targetNanoGrid,
+                output.data_ptr<float>());
+        break;
+    case StencilKind::Laplace7:
+        stencilConvKernel<Laplace3DStencil>
+            <<<numTargetLeaves, kThreads, 0, stream>>>(
+                inputFeatures.data_ptr<float>(),
+                weights.data_ptr<float>(),
+                sourceNanoGrid,
+                targetNanoGrid,
+                output.data_ptr<float>());
+        break;
+    default:
+        TORCH_CHECK(false, "StencilConv: unknown StencilKind ", static_cast<int>(kind));
+    }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     return output;

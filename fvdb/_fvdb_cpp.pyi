@@ -103,11 +103,13 @@ def pred_gather_igemm_conv(
 ) -> torch.Tensor: ...
 
 # StencilConv: CTA-per-leaf scalar stencil convolution (forward only, R=1, stride 1)
+# stencil_kind: 0 = Dense27 (27 taps), 1 = Laplace7 (center + 6 face neighbors)
 def stencil_conv(
     features: torch.Tensor,
     weights: torch.Tensor,
     source_grid: GridBatch,
     target_grid: GridBatch,
+    stencil_kind: int = 0,
 ) -> torch.Tensor: ...
 
 class GaussianSplat3d:

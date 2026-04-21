@@ -95,6 +95,70 @@ class _PredGatherIGemmConvFn(torch.autograd.Function):
         return grad_feat, grad_w, None, None, None, None, None
 
 
+_STENCIL_KIND_DENSE27 = 0
+_STENCIL_KIND_LAPLACE7 = 1
+
+_STENCIL_KIND_BY_NAME: dict[str, int] = {
+    "dense27": _STENCIL_KIND_DENSE27,
+    "laplace7": _STENCIL_KIND_LAPLACE7,
+}
+
+# Weight-tensor positions used by each sparse stencil. Indexed into a
+# [1,1,3,3,3] tensor as weights[0, 0, di+1, dj+1, dk+1]. Dense27 uses every
+# position so it is not listed here.
+_LAPLACE7_ON_STENCIL_OFFSETS: tuple[tuple[int, int, int], ...] = (
+    (1, 1, 1),  # center
+    (0, 1, 1), (2, 1, 1),  # x-axis
+    (1, 0, 1), (1, 2, 1),  # y-axis
+    (1, 1, 0), (1, 1, 2),  # z-axis
+)
+
+# Per-device cache of the 20-element flattened-index vector of off-stencil
+# weight positions, built lazily on first use. Reused across all validation
+# calls on that device so we don't pay `torch.zeros` + 7 scalar assignments
+# per forward pass.
+_LAPLACE7_OFF_STENCIL_INDEX: dict[torch.device, torch.Tensor] = {}
+
+
+def _laplace7_off_stencil_index(device: torch.device) -> torch.Tensor:
+    cached = _LAPLACE7_OFF_STENCIL_INDEX.get(device)
+    if cached is not None:
+        return cached
+    mask = torch.ones(27, dtype=torch.bool, device=device)
+    for i, j, k in _LAPLACE7_ON_STENCIL_OFFSETS:
+        mask[i * 9 + j * 3 + k] = False
+    idx = torch.nonzero(mask, as_tuple=False).squeeze(1).contiguous()
+    _LAPLACE7_OFF_STENCIL_INDEX[device] = idx
+    return idx
+
+
+def _validate_laplace7_weights(weights: torch.Tensor) -> None:
+    """Error if any off-stencil weight slot is nonzero.
+
+    For the Laplace7 specialization the CUDA kernel only reads the 7 on-stencil
+    positions; any nonzero value written to the other 20 positions would be
+    silently dropped, giving a result that diverges from the dense 27-tap
+    reference. We reject such weight tensors up front so the failure is
+    loud and actionable.
+
+    Uses a cached per-device index vector and a single fused reduction so
+    validation costs roughly one small kernel launch plus one device sync,
+    not a dozen launches per call.
+    """
+    idx = _laplace7_off_stencil_index(weights.device)
+    off = weights.view(-1).index_select(0, idx)
+    max_abs = off.abs().amax().item()  # single D2H sync
+    if max_abs != 0.0:
+        raise ValueError(
+            "StencilConv laplace7 requires off-stencil weight positions to be "
+            f"exactly zero; max |off-stencil weight| = {max_abs:.3e}. "
+            "Either zero out the 20 non-Laplacian positions, or drop stencil='laplace7' "
+            "from expert_config to use the Dense27 path. "
+            "If you want to skip this check for performance, pass "
+            "expert_config={..., 'validate_weights': False}."
+        )
+
+
 class _StencilConvFn(torch.autograd.Function):
     """Autograd wrapper for the StencilConv CTA-per-leaf scalar stencil kernel.
 
@@ -109,11 +173,14 @@ class _StencilConvFn(torch.autograd.Function):
         weights: torch.Tensor,
         source_grid: _fvdb_cpp.GridBatch,
         target_grid: _fvdb_cpp.GridBatch,
+        stencil_kind: int,
     ) -> torch.Tensor:
-        return _fvdb_cpp.stencil_conv(features, weights, source_grid, target_grid)
+        return _fvdb_cpp.stencil_conv(
+            features, weights, source_grid, target_grid, stencil_kind
+        )
 
     @staticmethod
-    def backward(ctx, grad_output: torch.Tensor) -> tuple[None, None, None, None]:  # type: ignore[override]
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[None, None, None, None, None]:  # type: ignore[override]
         raise NotImplementedError(
             "StencilConv backend does not support backward. "
             "Use 'gather_scatter' backend if gradients are required."
@@ -164,9 +231,17 @@ class _StencilConvBackend:
 
     Stateless — no precomputed topology. The kernel receives source/target
     grid data and features at execute time.
+
+    `stencil_kind` picks the compile-time specialization:
+      - 0 = Dense27  (all 27 taps of a 3x3x3 kernel)
+      - 1 = Laplace7 (center + 6 face neighbors; off-stencil weights must be 0)
+
+    `validate_weights` gates the per-execute check that off-stencil weight
+    slots are zero (only relevant for Laplace7). Defaults True.
     """
 
-    pass
+    stencil_kind: int = _STENCIL_KIND_DENSE27
+    validate_weights: bool = True
 
 
 _Backend = (
@@ -710,11 +785,14 @@ class ConvolutionPlan:
                     f"StencilConv backend requires in_channels=1 and out_channels=1, "
                     f"got ({in_c}, {out_c})."
                 )
+            if backend.stencil_kind == _STENCIL_KIND_LAPLACE7 and backend.validate_weights:
+                _validate_laplace7_weights(weights)
             out_tensor = _StencilConvFn.apply(
                 data.jdata,
                 weights,
                 self._source_grid._impl,
                 self._target_grid._impl,
+                backend.stencil_kind,
             )
             if out_tensor is None:
                 raise ValueError("StencilConv convolution returned None")
@@ -856,7 +934,17 @@ class ConvolutionPlan:
                         f"StencilConv backend requires in_channels=1 and out_channels=1, "
                         f"got ({cin}, {cout})."
                     )
-            return _StencilConvBackend()
+            stencil_name = expert_config.get("stencil", "dense27")
+            if stencil_name not in _STENCIL_KIND_BY_NAME:
+                raise ValueError(
+                    f"StencilConv 'stencil' must be one of "
+                    f"{sorted(_STENCIL_KIND_BY_NAME.keys())}, got {stencil_name!r}."
+                )
+            validate_weights = bool(expert_config.get("validate_weights", True))
+            return _StencilConvBackend(
+                stencil_kind=_STENCIL_KIND_BY_NAME[stencil_name],
+                validate_weights=validate_weights,
+            )
 
         # PredGatherIGemm — CUTLASS IGEMM on SM80+, forward only
         if backend_name == "pred_gather_igemm":

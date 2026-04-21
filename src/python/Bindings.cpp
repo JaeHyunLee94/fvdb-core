@@ -535,14 +535,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         [](torch::Tensor features,
            torch::Tensor weights,
            const fvdb::GridBatch &source_grid,
-           const fvdb::GridBatch &target_grid) -> torch::Tensor {
-            return fvdb::GridBatch::stencilConv(features, weights, source_grid, target_grid);
+           const fvdb::GridBatch &target_grid,
+           int64_t stencil_kind) -> torch::Tensor {
+            return fvdb::GridBatch::stencilConv(
+                features, weights, source_grid, target_grid, stencil_kind);
         },
-        "StencilConv forward sparse convolution (CTA-per-leaf, smem halo, scalar R=1).",
+        "StencilConv forward sparse convolution (CTA-per-leaf, smem halo, scalar R=1). "
+        "stencil_kind: 0 = Dense27 (27 taps), 1 = Laplace7 (center + 6 face neighbors).",
         py::arg("features"),
         py::arg("weights"),
         py::arg("source_grid"),
-        py::arg("target_grid"));
+        py::arg("target_grid"),
+        py::arg("stencil_kind") = 0);
 }
 
 TORCH_LIBRARY(fvdb, m) {
