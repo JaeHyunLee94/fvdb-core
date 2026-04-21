@@ -75,17 +75,10 @@ stencilConvKernel(const float *__restrict__ inputFeatures,
                   const nanovdb::NanoGrid<nanovdb::ValueOnIndex> *sourceGrid,
                   const nanovdb::NanoGrid<nanovdb::ValueOnIndex> *targetGrid,
                   float *__restrict__ outputFeatures) {
-    using SrcLeafT = nanovdb::NanoLeaf<nanovdb::ValueOnIndex>;
-
-    __shared__ float          haloValues[kHaloSize][kHaloSize][kHaloSize];
-    // 3x3x3 cache of source-leaf pointers covering the halo neighborhood.
-    // Indexed as haloLeaves[leafI][leafJ][leafK], where each axis ∈ {0,1,2}
-    // maps to the neighbor leaf offset {-1, 0, +1} along that axis. A null
-    // pointer marks a leaf that does not exist in the source grid.
-    __shared__ const SrcLeafT *haloLeaves[3][3][3];
+    __shared__ float haloValues[kHaloSize][kHaloSize][kHaloSize];
 
     const int leafID = blockIdx.x;
-    const int tid    = threadIdx.x;
+    const int tid   = threadIdx.x;
 
     const auto &outLeaf    = targetGrid->tree().template getFirstNode<0>()[leafID];
     const auto  leafOrigin = outLeaf.origin();
@@ -94,62 +87,22 @@ stencilConvKernel(const float *__restrict__ inputFeatures,
     const int   Lz         = leafOrigin[2];
 
     // ------------------------------------------------------------------
-    // Phase 0: 27-leaf neighborhood lookup (one tree walk per leaf, not per
-    // halo slot). First 27 threads each probe one leaf of the 3x3x3 block
-    // around the current output leaf; the remaining threads idle. Reduces
-    // tree traversals from ~1000/CTA to 27/CTA.
+    // Phase 1: cooperative halo population.
+    // 512 threads fill 1000 slots in two passes.  Pass 1 covers slots 0-511;
+    // pass 2 covers slots 512-999 and only the first 488 threads participate.
     // ------------------------------------------------------------------
     const auto &srcTree = sourceGrid->tree();
-    if (tid < 27) {
-        const int li = tid / 9;        // 0, 1, 2
-        const int lj = (tid / 3) % 3;
-        const int lk = tid % 3;
-        const nanovdb::Coord leafOri(Lx + (li - 1) * kLeafSize,
-                                     Ly + (lj - 1) * kLeafSize,
-                                     Lz + (lk - 1) * kLeafSize);
-        haloLeaves[li][lj][lk] = srcTree.root().probeLeaf(leafOri);
-    }
-    __syncthreads();
 
-    // ------------------------------------------------------------------
-    // Phase 1: cooperative halo population using cached leaf pointers.
-    // 512 threads fill 1000 slots in two passes (pass 2 uses 488 threads).
-    // Each slot does one O(1) leaf::getValue(localOffset) — no tree walk.
-    // ------------------------------------------------------------------
     #pragma unroll
     for (int pass = 0; pass < 2; ++pass) {
         const int s = tid + pass * kThreads;
         if (s < kHaloVoxels) {
-            const int i = s / (kHaloSize * kHaloSize);
-            const int j = (s / kHaloSize) % kHaloSize;
-            const int k = s % kHaloSize;
-
-            // Global coord of this halo slot.
-            const int gx = Lx - 1 + i;
-            const int gy = Ly - 1 + j;
-            const int gz = Lz - 1 + k;
-
-            // Which of the 27 neighbor leaves owns (gx,gy,gz)?
-            //   i=0       -> leafI = 0   (leaf at Lx-8)
-            //   i=1..8    -> leafI = 1   (current leaf at Lx)
-            //   i=9       -> leafI = 2   (leaf at Lx+8)
-            // (gx >> 3) - (Lx >> 3) computes the signed leaf-index delta.
-            const int leafI = (gx >> 3) - (Lx >> 3) + 1;
-            const int leafJ = (gy >> 3) - (Ly >> 3) + 1;
-            const int leafK = (gz >> 3) - (Lz >> 3) + 1;
-
-            const SrcLeafT *leaf = haloLeaves[leafI][leafJ][leafK];
-            float           val  = 0.0f;
-            if (leaf != nullptr) {
-                // Local offset within the leaf: (x & 7) << 6 | (y & 7) << 3 | (z & 7).
-                // Matches NanoLeaf<>::CoordToOffset for LOG2DIM=3.
-                const uint32_t localOff = ((gx & 0x7) << 6) | ((gy & 0x7) << 3) | (gz & 0x7);
-                const uint64_t raw      = leaf->getValue(localOff);
-                if (raw) {
-                    val = inputFeatures[raw - 1];
-                }
-            }
-            haloValues[i][j][k] = val;
+            const int          i = s / (kHaloSize * kHaloSize);
+            const int          j = (s / kHaloSize) % kHaloSize;
+            const int          k = s % kHaloSize;
+            const nanovdb::Coord ijk(Lx + i - 1, Ly + j - 1, Lz + k - 1);
+            const uint64_t     raw = srcTree.getValue(ijk);
+            haloValues[i][j][k]    = raw ? inputFeatures[raw - 1] : 0.0f;
         }
     }
     __syncthreads();
@@ -161,10 +114,8 @@ stencilConvKernel(const float *__restrict__ inputFeatures,
     const int lj = (tid >> 3) & 0x7;
     const int lk = tid & 0x7;
 
-    // outLeaf already covers (Lx+li, Ly+lj, Lz+lk) by construction, so skip
-    // the root-to-leaf tree walk; compute the packed local offset directly.
-    const uint32_t outLocalOff = (li << 6) | (lj << 3) | lk;
-    const int64_t  outIdx      = static_cast<int64_t>(outLeaf.getValue(outLocalOff)) - 1;
+    const nanovdb::Coord outIJK(Lx + li, Ly + lj, Lz + lk);
+    const int64_t        outIdx = static_cast<int64_t>(targetGrid->tree().getValue(outIJK)) - 1;
     if (outIdx < 0) {
         return;
     }
