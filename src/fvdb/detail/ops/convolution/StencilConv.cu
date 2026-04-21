@@ -37,7 +37,8 @@ stencilConvKernel(const float *__restrict__ inputFeatures,
                   const nanovdb::NanoGrid<nanovdb::ValueOnIndex> *sourceGrid,
                   const nanovdb::NanoGrid<nanovdb::ValueOnIndex> *targetGrid,
                   float *__restrict__ outputFeatures) {
-    __shared__ int64_t haloIndices[kHaloSize][kHaloSize][kHaloSize];
+    __shared__ float haloValues[kHaloSize][kHaloSize][kHaloSize];
+    //
 
     const int leafID = blockIdx.x;
     const int tid   = threadIdx.x;
@@ -64,7 +65,7 @@ stencilConvKernel(const float *__restrict__ inputFeatures,
             const int          k = s % kHaloSize;
             const nanovdb::Coord ijk(Lx + i - 1, Ly + j - 1, Lz + k - 1);
             const uint64_t     raw = srcAcc.getValue(ijk);
-            haloIndices[i][j][k]   = static_cast<int64_t>(raw) - 1;
+            haloValues[i][j][k]    = raw ? inputFeatures[raw - 1] : 0.0f;
         }
     }
     __syncthreads();
@@ -72,9 +73,10 @@ stencilConvKernel(const float *__restrict__ inputFeatures,
     // ------------------------------------------------------------------
     // Phase 2: per-thread output voxel accumulation.
     // ------------------------------------------------------------------
-    const int li = tid / (kLeafSize * kLeafSize);
-    const int lj = (tid / kLeafSize) % kLeafSize;
-    const int lk = tid % kLeafSize;
+    // Changing this to bit shifting?
+    const int li = (tid >> 6) & 0x7;
+    const int lj = (tid >> 3) & 0x7;
+    const int lk = tid & 0x7;
 
     const nanovdb::Coord outIJK(Lx + li, Ly + lj, Lz + lk);
     auto                 tgtAcc = targetGrid->getAccessor();
@@ -90,11 +92,8 @@ stencilConvKernel(const float *__restrict__ inputFeatures,
         for (int dj = -1; dj <= 1; ++dj) {
             #pragma unroll
             for (int dk = -1; dk <= 1; ++dk) {
-                const int64_t inIdx = haloIndices[li + di + 1][lj + dj + 1][lk + dk + 1];
-                if (inIdx >= 0) {
-                    const int woff = (di + 1) * 9 + (dj + 1) * 3 + (dk + 1);
-                    sum += weights[woff] * inputFeatures[inIdx];
-                }
+                const int woff = (di + 1) * 9 + (dj + 1) * 3 + (dk + 1);
+                sum += weights[woff] * haloValues[li + di + 1][lj + dj + 1][lk + dk + 1];
             }
         }
     }
