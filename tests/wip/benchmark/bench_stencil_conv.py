@@ -4,26 +4,34 @@
 """
 Standalone benchmark for the StencilConv sparse convolution backend.
 
-Runs a forward pass under both the `stencil` backend and the default
-(`gather_scatter`) backend across a few large topologies and prints a
-grouped table with timing, effective bandwidth, and % of A6000 peak.
+For each (topology, operator) pair, runs a forward pass under both the
+specialized stencil backend and the default `gather_scatter` backend with
+matching weights and channel counts, then prints a grouped table.
+
+Operators benchmarked:
+  dense27      : in=1, out=1, all 27 taps
+  laplace7     : in=1, out=1, center + 6 face neighbors
+  divergence   : in=3, out=1, central differences along each axis
+  gradient     : in=1, out=3, central differences along each axis
 
 Effective bandwidth counts only the "useful" data movement:
-    bytes = (N_in + N_out) * sizeof(float32)
-This is a lower bound on device traffic (halo gathers re-read neighbors,
-NanoVDB index lookups add more traffic), but it is the metric most
-directly comparable to HBM peak.
+    bytes = (N_in * in_c + N_out * out_c) * sizeof(float32)
+This is a lower bound on device traffic but is what's directly
+comparable to HBM peak.
 
 Usage:
     python tests/wip/benchmark/bench_stencil_conv.py
     python tests/wip/benchmark/bench_stencil_conv.py --warmup 20 --iters 100
+    python tests/wip/benchmark/bench_stencil_conv.py --only sphere_r140
+    python tests/wip/benchmark/bench_stencil_conv.py --ops divergence,gradient
 """
 
 from __future__ import annotations
 
 import argparse
-import math
 from collections import defaultdict
+from dataclasses import dataclass
+from typing import Callable
 
 import torch
 from fvdb.convolution_plan import _StencilConvBackend
@@ -66,17 +74,74 @@ def sphere_coords(radius: int, base: int | None = None) -> torch.Tensor:
 
 
 TOPOLOGIES = {
-    "dense_96": lambda: dense_block_coords(96),
-    "dense_180": lambda: dense_block_coords(180),
+    "dense_96":   lambda: dense_block_coords(96),
+    "dense_180":  lambda: dense_block_coords(180),
     "sphere_r140": lambda: sphere_coords(140),  # ~11.5M voxels
 }
 
-BACKENDS = {
-    "stencil": {"backend": "stencil"},
-    # validate_weights=False skips the per-execute off-stencil-zero check so
-    # the benchmark measures pure kernel time.
-    "laplace7": {"backend": "stencil", "stencil": "laplace7", "validate_weights": False},
-    "default": {"backend": "gather_scatter"},
+
+# =============================================================================
+# Operator specs
+# =============================================================================
+
+
+def _laplace7_on_stencil_weights() -> torch.Tensor:
+    """7 random nonzero positions in a [1,1,3,3,3] tensor, others exactly zero."""
+    pos = [
+        (1, 1, 1),
+        (0, 1, 1), (2, 1, 1),
+        (1, 0, 1), (1, 2, 1),
+        (1, 1, 0), (1, 1, 2),
+    ]
+    w = torch.zeros((1, 1, 3, 3, 3), device=DEVICE, dtype=DTYPE)
+    for i, j, k in pos:
+        w[0, 0, i, j, k] = torch.randn((), device=DEVICE, dtype=DTYPE)
+    return w
+
+
+def _dense27_weights() -> torch.Tensor:
+    """27 random weights in a [1,1,3,3,3] tensor — Dense27 reads them all."""
+    return torch.randn((1, 1, 3, 3, 3), device=DEVICE, dtype=DTYPE)
+
+
+def _divergence_weights() -> torch.Tensor:
+    """Central-difference divergence weights (with random magnitudes per axis)."""
+    fx = torch.randn((), device=DEVICE, dtype=DTYPE).item()
+    fy = torch.randn((), device=DEVICE, dtype=DTYPE).item()
+    fz = torch.randn((), device=DEVICE, dtype=DTYPE).item()
+    w = torch.zeros((1, 3, 3, 3, 3), device=DEVICE, dtype=DTYPE)
+    w[0, 0, 0, 1, 1] = -fx; w[0, 0, 2, 1, 1] = +fx
+    w[0, 1, 1, 0, 1] = -fy; w[0, 1, 1, 2, 1] = +fy
+    w[0, 2, 1, 1, 0] = -fz; w[0, 2, 1, 1, 2] = +fz
+    return w
+
+
+def _gradient_weights() -> torch.Tensor:
+    """Central-difference gradient weights (random magnitudes per axis)."""
+    fx = torch.randn((), device=DEVICE, dtype=DTYPE).item()
+    fy = torch.randn((), device=DEVICE, dtype=DTYPE).item()
+    fz = torch.randn((), device=DEVICE, dtype=DTYPE).item()
+    w = torch.zeros((3, 1, 3, 3, 3), device=DEVICE, dtype=DTYPE)
+    w[0, 0, 0, 1, 1] = -fx; w[0, 0, 2, 1, 1] = +fx
+    w[1, 0, 1, 0, 1] = -fy; w[1, 0, 1, 2, 1] = +fy
+    w[2, 0, 1, 1, 0] = -fz; w[2, 0, 1, 1, 2] = +fz
+    return w
+
+
+@dataclass(frozen=True)
+class Operator:
+    name: str                          # e.g. "laplace7"
+    stencil_name: str | None           # passed as expert_config["stencil"]; None for default-stencil (dense27)
+    in_c: int
+    out_c: int
+    weights_fn: Callable[[], torch.Tensor]
+
+
+OPERATORS: dict[str, Operator] = {
+    "dense27":    Operator("dense27",    None,         1, 1, _dense27_weights),
+    "laplace7":   Operator("laplace7",   "laplace7",   1, 1, _laplace7_on_stencil_weights),
+    "divergence": Operator("divergence", "divergence", 3, 1, _divergence_weights),
+    "gradient":   Operator("gradient",   "gradient",   1, 3, _gradient_weights),
 }
 
 
@@ -85,47 +150,39 @@ BACKENDS = {
 # =============================================================================
 
 
-LAPLACE7_ON_STENCIL = [
-    (1, 1, 1),
-    (0, 1, 1), (2, 1, 1),
-    (1, 0, 1), (1, 2, 1),
-    (1, 1, 0), (1, 1, 2),
-]
+def _stencil_config(op: Operator) -> dict:
+    cfg: dict = {"backend": "stencil"}
+    if op.stencil_name is not None:
+        cfg["stencil"] = op.stencil_name
+    # Skip the off-stencil-zero check during timing so we measure pure kernel time.
+    cfg["validate_weights"] = False
+    return cfg
 
 
-def _make_weights_for(backend: str) -> torch.Tensor:
-    """Build a weight tensor valid for the given backend.
-
-    The Laplace7 backend validates that off-stencil positions are zero, so
-    a fully-random tensor would fail its check. We produce a weight tensor
-    with nonzero values only at the 7 Laplacian positions; the Dense27 and
-    gather_scatter paths accept this shape too (the 20 zeroed taps simply
-    don't contribute), so the three backends are timed on identical inputs.
-    """
-    w = torch.zeros((1, 1, 3, 3, 3), device=DEVICE, dtype=DTYPE)
-    for i, j, k in LAPLACE7_ON_STENCIL:
-        w[0, 0, i, j, k] = torch.randn((), device=DEVICE, dtype=DTYPE)
-    return w
+def _gs_config() -> dict:
+    return {"backend": "gather_scatter"}
 
 
-def build(topology: str, backend: str):
+def build(topology: str, op: Operator, backend_kind: str):
     coords = TOPOLOGIES[topology]()
     grid = create_grid_from_coords(coords, DEVICE)
     dst_grid = grid.conv_grid(kernel_size=KERNEL_SIZE, stride=1)
 
     features = JaggedTensor(
-        torch.randn((grid.total_voxels, 1), device=DEVICE, dtype=DTYPE)
+        torch.randn((grid.total_voxels, op.in_c), device=DEVICE, dtype=DTYPE)
     )
-    weights = _make_weights_for(backend)
+    weights = op.weights_fn()
 
+    expert_config = _stencil_config(op) if backend_kind == "stencil" else _gs_config()
     plan = ConvolutionPlan.from_grid_batch(
         kernel_size=KERNEL_SIZE,
         stride=1,
         source_grid=grid,
         target_grid=dst_grid,
-        expert_config=BACKENDS[backend],
+        channel_pairs=((op.in_c, op.out_c),),
+        expert_config=expert_config,
     )
-    if backend in ("stencil", "laplace7"):
+    if backend_kind == "stencil":
         assert isinstance(plan._backend, _StencilConvBackend)
 
     return plan, features, weights, grid.total_voxels, dst_grid.total_voxels
@@ -154,59 +211,62 @@ def time_plan(plan, features, weights, warmup: int, iters: int) -> float:
 
 
 def format_results_table(results: list[dict]) -> str:
-    by_topo: dict[str, dict[str, dict]] = defaultdict(dict)
+    by_key: dict[tuple[str, str], dict[str, dict]] = defaultdict(dict)
     for r in results:
-        by_topo[r["topology"]][r["backend"]] = r
+        by_key[(r["topology"], r["op"])][r["backend"]] = r
 
-    col_widths = (14, 9, 12, 12, 11, 11, 8, 10)
+    col_widths = (14, 11, 9, 12, 12, 11, 11, 8, 10)
     sep = "-" * (sum(col_widths) + len(col_widths) - 1)
     header = (
         f"{'topology':<{col_widths[0]}} "
-        f"{'backend':<{col_widths[1]}} "
-        f"{'n_in':>{col_widths[2]}} "
-        f"{'n_out':>{col_widths[3]}} "
-        f"{'mean (ms)':>{col_widths[4]}} "
-        f"{'bw (GB/s)':>{col_widths[5]}} "
-        f"{'% peak':>{col_widths[6]}} "
-        f"{'speedup':>{col_widths[7]}}"
+        f"{'operator':<{col_widths[1]}} "
+        f"{'backend':<{col_widths[2]}} "
+        f"{'n_in':>{col_widths[3]}} "
+        f"{'n_out':>{col_widths[4]}} "
+        f"{'mean (ms)':>{col_widths[5]}} "
+        f"{'bw (GB/s)':>{col_widths[6]}} "
+        f"{'% peak':>{col_widths[7]}} "
+        f"{'speedup':>{col_widths[8]}}"
     )
 
     lines = [
         "",
         sep,
-        f"StencilConv backends  —  {torch.cuda.get_device_name(0)}  "
+        f"StencilConv vs gather_scatter — {torch.cuda.get_device_name(0)} "
         f"(peak {A6000_PEAK_GBPS:.0f} GB/s)",
-        "speedup = default_mean / backend_mean  (for each stencil backend)",
+        "speedup = default_mean / stencil_mean  (per row pair)",
         sep,
         header,
         sep,
     ]
 
+    # Iterate in stable topology × operator order.
     for topo in TOPOLOGIES.keys():
-        rows = by_topo.get(topo)
-        if not rows:
-            continue
-        d_row = rows.get("default")
-
-        for backend in ("stencil", "laplace7", "default"):
-            r = rows.get(backend)
-            if r is None:
+        for op_name in OPERATORS.keys():
+            rows = by_key.get((topo, op_name))
+            if not rows:
                 continue
-            if backend != "default" and d_row is not None:
-                speedup_str = f"{d_row['mean_ms'] / r['mean_ms']:>{col_widths[7] - 1}.2f}x"
-            else:
-                speedup_str = f"{'-':>{col_widths[7]}}"
-            lines.append(
-                f"{r['topology']:<{col_widths[0]}} "
-                f"{r['backend']:<{col_widths[1]}} "
-                f"{r['n_in']:>{col_widths[2]},d} "
-                f"{r['n_out']:>{col_widths[3]},d} "
-                f"{r['mean_ms']:>{col_widths[4]}.3f} "
-                f"{r['bw_gbps']:>{col_widths[5]}.2f} "
-                f"{r['pct_peak']:>{col_widths[6] - 1}.1f}% "
-                f"{speedup_str}"
-            )
-        lines.append("")
+            d_row = rows.get("default")
+            for backend in ("stencil", "default"):
+                r = rows.get(backend)
+                if r is None:
+                    continue
+                if backend == "stencil" and d_row is not None:
+                    speedup_str = f"{d_row['mean_ms'] / r['mean_ms']:>{col_widths[8] - 1}.2f}x"
+                else:
+                    speedup_str = f"{'-':>{col_widths[8]}}"
+                lines.append(
+                    f"{r['topology']:<{col_widths[0]}} "
+                    f"{r['op']:<{col_widths[1]}} "
+                    f"{r['backend']:<{col_widths[2]}} "
+                    f"{r['n_in']:>{col_widths[3]},d} "
+                    f"{r['n_out']:>{col_widths[4]},d} "
+                    f"{r['mean_ms']:>{col_widths[5]}.3f} "
+                    f"{r['bw_gbps']:>{col_widths[6]}.2f} "
+                    f"{r['pct_peak']:>{col_widths[7] - 1}.1f}% "
+                    f"{speedup_str}"
+                )
+            lines.append("")
 
     lines.append(sep)
     return "\n".join(lines)
@@ -227,6 +287,13 @@ def main():
         default=None,
         help="Comma-separated topology names to run (default: all)",
     )
+    parser.add_argument(
+        "--ops",
+        type=str,
+        default=None,
+        help="Comma-separated operator names to run (default: all). "
+             f"Available: {','.join(OPERATORS.keys())}",
+    )
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -240,34 +307,45 @@ def main():
             raise SystemExit(f"Unknown topology: {sorted(unknown)}. Known: {topos}")
         topos = [t for t in topos if t in requested]
 
+    ops = list(OPERATORS.keys())
+    if args.ops:
+        requested = {t.strip() for t in args.ops.split(",") if t.strip()}
+        unknown = requested - set(ops)
+        if unknown:
+            raise SystemExit(f"Unknown operator: {sorted(unknown)}. Known: {ops}")
+        ops = [t for t in ops if t in requested]
+
     print(f"Device: {torch.cuda.get_device_name(0)}")
     print(f"Warmup: {args.warmup} iters   Timed: {args.iters} iters")
     print()
 
     results: list[dict] = []
     for topo in topos:
-        for backend in BACKENDS.keys():
-            print(f"  building {topo}/{backend} ...", end="", flush=True)
-            plan, feat, w, n_in, n_out = build(topo, backend)
-            print(f" n_in={n_in:,}, n_out={n_out:,}", end="", flush=True)
-            mean_ms = time_plan(plan, feat, w, warmup=args.warmup, iters=args.iters)
-            useful_bytes = (n_in + n_out) * BYTES_PER_F32
-            bw_gbps = useful_bytes / (mean_ms * 1e-3) / 1e9
-            pct_peak = 100 * bw_gbps / A6000_PEAK_GBPS
-            print(f"  ->  {mean_ms:.3f} ms   {bw_gbps:.2f} GB/s")
-            results.append(
-                dict(
-                    topology=topo,
-                    backend=backend,
-                    n_in=int(n_in),
-                    n_out=int(n_out),
-                    mean_ms=mean_ms,
-                    bw_gbps=bw_gbps,
-                    pct_peak=pct_peak,
+        for op_name in ops:
+            op = OPERATORS[op_name]
+            for backend_kind in ("stencil", "default"):
+                tag = f"{topo}/{op_name}/{backend_kind}"
+                print(f"  {tag:<40s} ...", end="", flush=True)
+                plan, feat, w, n_in, n_out = build(topo, op, backend_kind)
+                mean_ms = time_plan(plan, feat, w, warmup=args.warmup, iters=args.iters)
+                useful_bytes = (n_in * op.in_c + n_out * op.out_c) * BYTES_PER_F32
+                bw_gbps = useful_bytes / (mean_ms * 1e-3) / 1e9
+                pct_peak = 100 * bw_gbps / A6000_PEAK_GBPS
+                print(f"  {mean_ms:7.3f} ms   {bw_gbps:7.2f} GB/s")
+                results.append(
+                    dict(
+                        topology=topo,
+                        op=op_name,
+                        backend=backend_kind,
+                        n_in=int(n_in),
+                        n_out=int(n_out),
+                        mean_ms=mean_ms,
+                        bw_gbps=bw_gbps,
+                        pct_peak=pct_peak,
+                    )
                 )
-            )
-            del plan, feat, w
-            torch.cuda.empty_cache()
+                del plan, feat, w
+                torch.cuda.empty_cache()
 
     print(format_results_table(results))
 

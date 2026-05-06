@@ -540,8 +540,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             return fvdb::GridBatch::stencilConv(
                 features, weights, source_grid, target_grid, stencil_kind);
         },
-        "StencilConv forward sparse convolution (CTA-per-leaf, smem halo, scalar R=1). "
-        "stencil_kind: 0 = Dense27 (27 taps), 1 = Laplace7 (center + 6 face neighbors).",
+        "StencilConv forward sparse convolution (CTA-per-leaf, smem halo, R=1). "
+        "stencil_kind: 0 = Dense27 (in=1, out=1, 27 taps), 1 = Laplace7 (in=1, out=1, "
+        "7 taps), 2 = Divergence (in=3, out=1, 6 taps), 3 = Gradient (in=1, out=3, 6 taps).",
         py::arg("features"),
         py::arg("weights"),
         py::arg("source_grid"),

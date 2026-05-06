@@ -36,6 +36,8 @@ from fvdb import ConvolutionPlan, JaggedTensor
 
 STENCIL_CONFIG: dict = {"backend": "stencil"}
 STENCIL_LAPLACE7_CONFIG: dict = {"backend": "stencil", "stencil": "laplace7"}
+STENCIL_DIVERGENCE_CONFIG: dict = {"backend": "stencil", "stencil": "divergence"}
+STENCIL_GRADIENT_CONFIG: dict = {"backend": "stencil", "stencil": "gradient"}
 GS_CONFIG: dict = {"backend": "gather_scatter"}
 
 # Scalar fp32 — strict tolerance since both backends do the same accumulation
@@ -640,6 +642,319 @@ class TestConvStencil(unittest.TestCase):
         # Sanity: both backends should at minimum produce non-trivial throughput.
         self.assertGreater(stencil_bw, 0.0)
         self.assertGreater(default_bw, 0.0)
+
+    # -------------------------------------------------------------------------
+    # Divergence specialization (in_c=3, out_c=1)
+    # -------------------------------------------------------------------------
+
+    def _make_divergence_weights(self, fx: float = 0.5, fy: float = 0.5, fz: float = 0.5):
+        """Standard 3D divergence stencil: central differences along each axis.
+
+        weights[0, 0, 0|2, 1, 1] = ∓fx   (∂Fx/∂x)
+        weights[0, 1, 1, 0|2, 1] = ∓fy   (∂Fy/∂y)
+        weights[0, 2, 1, 1, 0|2] = ∓fz   (∂Fz/∂z)
+        """
+        w = torch.zeros((1, 3, 3, 3, 3), device=self.DEVICE, dtype=self.DTYPE)
+        w[0, 0, 0, 1, 1] = -fx
+        w[0, 0, 2, 1, 1] = +fx
+        w[0, 1, 1, 0, 1] = -fy
+        w[0, 1, 1, 2, 1] = +fy
+        w[0, 2, 1, 1, 0] = -fz
+        w[0, 2, 1, 1, 2] = +fz
+        return w
+
+    def test_divergence_matches_gather_scatter_classical(self):
+        """Standard ±0.5 divergence weights — stencil path matches gather_scatter."""
+        cluster = get_cluster_edge_aligned(self.KERNEL_SIZE, self.DEVICE)
+        grid = create_grid_from_coords(cluster, self.DEVICE)
+        dst_grid = grid.conv_grid(kernel_size=self.KERNEL_SIZE, stride=1)
+        n = len(cluster)
+
+        features = JaggedTensor(torch.randn((n, 3), device=self.DEVICE, dtype=self.DTYPE))
+        weights = self._make_divergence_weights()
+
+        stencil_plan = ConvolutionPlan.from_grid_batch(
+            kernel_size=self.KERNEL_SIZE, stride=1,
+            source_grid=grid, target_grid=dst_grid,
+            channel_pairs=((3, 1),),
+            expert_config=STENCIL_DIVERGENCE_CONFIG,
+        )
+        gs_plan = ConvolutionPlan.from_grid_batch(
+            kernel_size=self.KERNEL_SIZE, stride=1,
+            source_grid=grid, target_grid=dst_grid,
+            channel_pairs=((3, 1),),
+            expert_config=GS_CONFIG,
+        )
+        torch.testing.assert_close(
+            stencil_plan.execute(features, weights).jdata,
+            gs_plan.execute(features, weights).jdata,
+            rtol=RTOL, atol=ATOL,
+        )
+
+    def test_divergence_matches_gather_scatter_random_on_stencil(self):
+        """Random on-stencil values for the 6 divergence taps; many impulses."""
+        impulse_coords, _ = generate_hermit_impulses_dense(
+            num_candidates=self.NUM_CANDIDATES,
+            volume_shape=self.VOLUME_SHAPE,
+            kernel_size=self.KERNEL_SIZE,
+            impulse_value=1,
+            dtype=self.DTYPE,
+            device=self.DEVICE,
+        )
+        grid = create_grid_from_coords(impulse_coords, self.DEVICE)
+        dst_grid = grid.conv_grid(kernel_size=self.KERNEL_SIZE, stride=1)
+        n = grid.total_voxels
+
+        features = JaggedTensor(torch.randn((n, 3), device=self.DEVICE, dtype=self.DTYPE))
+        weights = self._make_divergence_weights(
+            fx=torch.randn((), device=self.DEVICE, dtype=self.DTYPE).item(),
+            fy=torch.randn((), device=self.DEVICE, dtype=self.DTYPE).item(),
+            fz=torch.randn((), device=self.DEVICE, dtype=self.DTYPE).item(),
+        )
+
+        stencil_plan = ConvolutionPlan.from_grid_batch(
+            kernel_size=self.KERNEL_SIZE, stride=1,
+            source_grid=grid, target_grid=dst_grid,
+            channel_pairs=((3, 1),),
+            expert_config=STENCIL_DIVERGENCE_CONFIG,
+        )
+        gs_plan = ConvolutionPlan.from_grid_batch(
+            kernel_size=self.KERNEL_SIZE, stride=1,
+            source_grid=grid, target_grid=dst_grid,
+            channel_pairs=((3, 1),),
+            expert_config=GS_CONFIG,
+        )
+        torch.testing.assert_close(
+            stencil_plan.execute(features, weights).jdata,
+            gs_plan.execute(features, weights).jdata,
+            rtol=RTOL, atol=ATOL,
+        )
+
+    def test_divergence_rejects_nonzero_off_stencil_weights(self):
+        """A fully random (1,3,3,3,3) weight tensor must be rejected at execute."""
+        cluster = get_cluster_edge_aligned(self.KERNEL_SIZE, self.DEVICE)
+        grid = create_grid_from_coords(cluster, self.DEVICE)
+        n = len(cluster)
+
+        plan = ConvolutionPlan.from_grid_batch(
+            kernel_size=self.KERNEL_SIZE, stride=1,
+            source_grid=grid,
+            channel_pairs=((3, 1),),
+            expert_config=STENCIL_DIVERGENCE_CONFIG,
+        )
+        features = JaggedTensor(torch.randn((n, 3), device=self.DEVICE, dtype=self.DTYPE))
+        weights = torch.randn((1, 3, 3, 3, 3), device=self.DEVICE, dtype=self.DTYPE)
+        with self.assertRaises(ValueError) as cm:
+            plan.execute(features, weights)
+        self.assertIn("divergence", str(cm.exception).lower())
+
+    def test_divergence_rejects_wrong_input_channels(self):
+        """Passing a 1-channel input to the divergence path must error at plan time."""
+        cluster = get_cluster_edge_aligned(self.KERNEL_SIZE, self.DEVICE)
+        grid = create_grid_from_coords(cluster, self.DEVICE)
+        with self.assertRaises(ValueError):
+            ConvolutionPlan.from_grid_batch(
+                kernel_size=self.KERNEL_SIZE, stride=1,
+                source_grid=grid,
+                channel_pairs=((1, 1),),  # divergence expects in=3
+                expert_config=STENCIL_DIVERGENCE_CONFIG,
+            )
+
+    # -------------------------------------------------------------------------
+    # Gradient specialization (in_c=1, out_c=3)
+    # -------------------------------------------------------------------------
+
+    def _make_gradient_weights(self, fx: float = 0.5, fy: float = 0.5, fz: float = 0.5):
+        """Standard 3D gradient: central differences, one output channel per axis."""
+        w = torch.zeros((3, 1, 3, 3, 3), device=self.DEVICE, dtype=self.DTYPE)
+        w[0, 0, 0, 1, 1] = -fx; w[0, 0, 2, 1, 1] = +fx  # ∂/∂x → out 0
+        w[1, 0, 1, 0, 1] = -fy; w[1, 0, 1, 2, 1] = +fy  # ∂/∂y → out 1
+        w[2, 0, 1, 1, 0] = -fz; w[2, 0, 1, 1, 2] = +fz  # ∂/∂z → out 2
+        return w
+
+    def test_gradient_matches_gather_scatter_classical(self):
+        cluster = get_cluster_edge_aligned(self.KERNEL_SIZE, self.DEVICE)
+        grid = create_grid_from_coords(cluster, self.DEVICE)
+        dst_grid = grid.conv_grid(kernel_size=self.KERNEL_SIZE, stride=1)
+        n = len(cluster)
+
+        features = JaggedTensor(torch.randn((n, 1), device=self.DEVICE, dtype=self.DTYPE))
+        weights = self._make_gradient_weights()
+
+        stencil_plan = ConvolutionPlan.from_grid_batch(
+            kernel_size=self.KERNEL_SIZE, stride=1,
+            source_grid=grid, target_grid=dst_grid,
+            channel_pairs=((1, 3),),
+            expert_config=STENCIL_GRADIENT_CONFIG,
+        )
+        gs_plan = ConvolutionPlan.from_grid_batch(
+            kernel_size=self.KERNEL_SIZE, stride=1,
+            source_grid=grid, target_grid=dst_grid,
+            channel_pairs=((1, 3),),
+            expert_config=GS_CONFIG,
+        )
+        torch.testing.assert_close(
+            stencil_plan.execute(features, weights).jdata,
+            gs_plan.execute(features, weights).jdata,
+            rtol=RTOL, atol=ATOL,
+        )
+
+    def test_gradient_matches_gather_scatter_many_impulses(self):
+        impulse_coords, _ = generate_hermit_impulses_dense(
+            num_candidates=self.NUM_CANDIDATES,
+            volume_shape=self.VOLUME_SHAPE,
+            kernel_size=self.KERNEL_SIZE,
+            impulse_value=1,
+            dtype=self.DTYPE,
+            device=self.DEVICE,
+        )
+        grid = create_grid_from_coords(impulse_coords, self.DEVICE)
+        dst_grid = grid.conv_grid(kernel_size=self.KERNEL_SIZE, stride=1)
+        n = grid.total_voxels
+
+        features = JaggedTensor(torch.randn((n, 1), device=self.DEVICE, dtype=self.DTYPE))
+        weights = self._make_gradient_weights(
+            fx=torch.randn((), device=self.DEVICE, dtype=self.DTYPE).item(),
+            fy=torch.randn((), device=self.DEVICE, dtype=self.DTYPE).item(),
+            fz=torch.randn((), device=self.DEVICE, dtype=self.DTYPE).item(),
+        )
+
+        stencil_plan = ConvolutionPlan.from_grid_batch(
+            kernel_size=self.KERNEL_SIZE, stride=1,
+            source_grid=grid, target_grid=dst_grid,
+            channel_pairs=((1, 3),),
+            expert_config=STENCIL_GRADIENT_CONFIG,
+        )
+        gs_plan = ConvolutionPlan.from_grid_batch(
+            kernel_size=self.KERNEL_SIZE, stride=1,
+            source_grid=grid, target_grid=dst_grid,
+            channel_pairs=((1, 3),),
+            expert_config=GS_CONFIG,
+        )
+        torch.testing.assert_close(
+            stencil_plan.execute(features, weights).jdata,
+            gs_plan.execute(features, weights).jdata,
+            rtol=RTOL, atol=ATOL,
+        )
+
+    def test_gradient_rejects_nonzero_off_stencil_weights(self):
+        cluster = get_cluster_edge_aligned(self.KERNEL_SIZE, self.DEVICE)
+        grid = create_grid_from_coords(cluster, self.DEVICE)
+        n = len(cluster)
+
+        plan = ConvolutionPlan.from_grid_batch(
+            kernel_size=self.KERNEL_SIZE, stride=1,
+            source_grid=grid,
+            channel_pairs=((1, 3),),
+            expert_config=STENCIL_GRADIENT_CONFIG,
+        )
+        features = JaggedTensor(torch.randn((n, 1), device=self.DEVICE, dtype=self.DTYPE))
+        weights = torch.randn((3, 1, 3, 3, 3), device=self.DEVICE, dtype=self.DTYPE)
+        with self.assertRaises(ValueError) as cm:
+            plan.execute(features, weights)
+        self.assertIn("gradient", str(cm.exception).lower())
+
+    def test_gradient_rejects_wrong_output_channels(self):
+        cluster = get_cluster_edge_aligned(self.KERNEL_SIZE, self.DEVICE)
+        grid = create_grid_from_coords(cluster, self.DEVICE)
+        with self.assertRaises(ValueError):
+            ConvolutionPlan.from_grid_batch(
+                kernel_size=self.KERNEL_SIZE, stride=1,
+                source_grid=grid,
+                channel_pairs=((1, 1),),  # gradient expects out=3
+                expert_config=STENCIL_GRADIENT_CONFIG,
+            )
+
+    # -------------------------------------------------------------------------
+    # MAC-grid Divergence / Gradient (forward / backward differences)
+    # -------------------------------------------------------------------------
+
+    def _make_mac_divergence_weights(self):
+        """ConvSolve-style MAC divergence: forward difference along each axis."""
+        w = torch.zeros((1, 3, 3, 3, 3), device=self.DEVICE, dtype=self.DTYPE)
+        # axis 0: u[i+1] - u[i]
+        w[0, 0, 2, 1, 1] = +1.0; w[0, 0, 1, 1, 1] = -1.0
+        # axis 1: v[j+1] - v[j]
+        w[0, 1, 1, 2, 1] = +1.0; w[0, 1, 1, 1, 1] = -1.0
+        # axis 2: w[k+1] - w[k]
+        w[0, 2, 1, 1, 2] = +1.0; w[0, 2, 1, 1, 1] = -1.0
+        return w
+
+    def _make_mac_gradient_weights(self):
+        """ConvSolve-style MAC gradient: backward difference per output channel."""
+        w = torch.zeros((3, 1, 3, 3, 3), device=self.DEVICE, dtype=self.DTYPE)
+        w[0, 0, 1, 1, 1] = +1.0; w[0, 0, 0, 1, 1] = -1.0   # ∂/∂x
+        w[1, 0, 1, 1, 1] = +1.0; w[1, 0, 1, 0, 1] = -1.0   # ∂/∂y
+        w[2, 0, 1, 1, 1] = +1.0; w[2, 0, 1, 1, 0] = -1.0   # ∂/∂z
+        return w
+
+    def test_mac_divergence_matches_gather_scatter(self):
+        impulse_coords, _ = generate_hermit_impulses_dense(
+            num_candidates=self.NUM_CANDIDATES,
+            volume_shape=self.VOLUME_SHAPE,
+            kernel_size=self.KERNEL_SIZE,
+            impulse_value=1,
+            dtype=self.DTYPE,
+            device=self.DEVICE,
+        )
+        grid = create_grid_from_coords(impulse_coords, self.DEVICE)
+        dst_grid = grid.conv_grid(kernel_size=self.KERNEL_SIZE, stride=1)
+        n = grid.total_voxels
+
+        features = JaggedTensor(torch.randn((n, 3), device=self.DEVICE, dtype=self.DTYPE))
+        weights = self._make_mac_divergence_weights()
+
+        stencil_plan = ConvolutionPlan.from_grid_batch(
+            kernel_size=self.KERNEL_SIZE, stride=1,
+            source_grid=grid, target_grid=dst_grid,
+            channel_pairs=((3, 1),),
+            expert_config={"backend": "stencil", "stencil": "mac-divergence"},
+        )
+        gs_plan = ConvolutionPlan.from_grid_batch(
+            kernel_size=self.KERNEL_SIZE, stride=1,
+            source_grid=grid, target_grid=dst_grid,
+            channel_pairs=((3, 1),),
+            expert_config=GS_CONFIG,
+        )
+        torch.testing.assert_close(
+            stencil_plan.execute(features, weights).jdata,
+            gs_plan.execute(features, weights).jdata,
+            rtol=RTOL, atol=ATOL,
+        )
+
+    def test_mac_gradient_matches_gather_scatter(self):
+        impulse_coords, _ = generate_hermit_impulses_dense(
+            num_candidates=self.NUM_CANDIDATES,
+            volume_shape=self.VOLUME_SHAPE,
+            kernel_size=self.KERNEL_SIZE,
+            impulse_value=1,
+            dtype=self.DTYPE,
+            device=self.DEVICE,
+        )
+        grid = create_grid_from_coords(impulse_coords, self.DEVICE)
+        dst_grid = grid.conv_grid(kernel_size=self.KERNEL_SIZE, stride=1)
+        n = grid.total_voxels
+
+        features = JaggedTensor(torch.randn((n, 1), device=self.DEVICE, dtype=self.DTYPE))
+        weights = self._make_mac_gradient_weights()
+
+        stencil_plan = ConvolutionPlan.from_grid_batch(
+            kernel_size=self.KERNEL_SIZE, stride=1,
+            source_grid=grid, target_grid=dst_grid,
+            channel_pairs=((1, 3),),
+            expert_config={"backend": "stencil", "stencil": "mac-gradient"},
+        )
+        gs_plan = ConvolutionPlan.from_grid_batch(
+            kernel_size=self.KERNEL_SIZE, stride=1,
+            source_grid=grid, target_grid=dst_grid,
+            channel_pairs=((1, 3),),
+            expert_config=GS_CONFIG,
+        )
+        torch.testing.assert_close(
+            stencil_plan.execute(features, weights).jdata,
+            gs_plan.execute(features, weights).jdata,
+            rtol=RTOL, atol=ATOL,
+        )
 
 
 if __name__ == "__main__":

@@ -102,8 +102,13 @@ def pred_gather_igemm_conv(
     stride: int,
 ) -> torch.Tensor: ...
 
-# StencilConv: CTA-per-leaf scalar stencil convolution (forward only, R=1, stride 1)
-# stencil_kind: 0 = Dense27 (27 taps), 1 = Laplace7 (center + 6 face neighbors)
+# StencilConv: CTA-per-leaf stencil convolution (forward only, R=1, stride 1).
+# Weights tensor shape is [out_c, in_c, 3, 3, 3].
+# stencil_kind:
+#   0 = Dense27    (in=1, out=1, all 27 taps)
+#   1 = Laplace7   (in=1, out=1, center + 6 face neighbors)
+#   2 = Divergence (in=3, out=1, central difference along each axis)
+#   3 = Gradient   (in=1, out=3, central difference along each axis)
 def stencil_conv(
     features: torch.Tensor,
     weights: torch.Tensor,

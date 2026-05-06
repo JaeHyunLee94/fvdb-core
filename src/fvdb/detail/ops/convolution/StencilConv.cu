@@ -174,7 +174,299 @@ stencilConvKernel(const float *__restrict__ inputFeatures,
     outputFeatures[outIdx] = sum;
 }
 
+// ===================================================================
+//                  Divergence and Gradient kernels
+// ===================================================================
+//
+// Both reuse the leaf-direct halo trick from stencilConvKernel:
+//   Phase 0  - 27 threads probe the 3x3x3 source-leaf neighborhood,
+//              cache pointers in haloLeaves[3][3][3].
+//   Phase 1  - 512 threads cover the 1000-slot halo in two passes,
+//              looking up the cached leaf and reading the feature
+//              value(s) via leaf->getValue(localOff). No tree walk.
+//   Phase 2  - per-thread accumulation against the relevant taps.
+//
+// The accumulation differs because the input/output channel counts
+// and tap structure are different:
+//
+//   Divergence : in=3, out=1. Halo carries 3 channels per slot
+//                (haloValues[10][10][10][3]). Phase 2 is one fold
+//                over Divergence3DStencil::Taps producing one scalar.
+//
+//   Gradient   : in=1, out=3. Halo carries 1 channel (same as
+//                Laplace7). Phase 2 produces three scalars (one per
+//                output channel) via a single fold; each
+//                ChannelTap<OC,...> accumulates into out[OC].
+
+constexpr int kInChannelsDiv  = 3;
+constexpr int kOutChannelsGrad = 3;
+
+// Compile-time fold for divergence: each tap reads halo[..., IC] and
+// adds weights[oc, ic, di+1, dj+1, dk+1] * halo[..., ic] to sum.
+// Weights tensor is row-major shape [out_c, in_c, 3, 3, 3], so the per-oc
+// stride is in_c * 27.
+template <typename StencilT, std::size_t... Is>
+__device__ __forceinline__ float
+sumDivergenceTapsImpl(const float *__restrict__ weights,
+                      const float (&halo)[kHaloSize][kHaloSize][kHaloSize][kInChannelsDiv],
+                      int li, int lj, int lk,
+                      std::index_sequence<Is...>) {
+    using Taps                       = typename StencilT::Taps;
+    constexpr int kInC               = StencilT::kInChannels;
+    constexpr int kPerOcStride       = kInC * 27;
+    float         sum                = 0.0f;
+    ((sum +=
+      weights[std::tuple_element_t<Is, Taps>::oc * kPerOcStride +
+              std::tuple_element_t<Is, Taps>::ic * 27 +
+              (std::tuple_element_t<Is, Taps>::di + 1) * 9 +
+              (std::tuple_element_t<Is, Taps>::dj + 1) * 3 +
+              (std::tuple_element_t<Is, Taps>::dk + 1)] *
+      halo[li + std::tuple_element_t<Is, Taps>::di + 1]
+          [lj + std::tuple_element_t<Is, Taps>::dj + 1]
+          [lk + std::tuple_element_t<Is, Taps>::dk + 1]
+          [std::tuple_element_t<Is, Taps>::ic]),
+     ...);
+    return sum;
+}
+
+template <typename StencilT>
+__device__ __forceinline__ float
+sumDivergenceTaps(const float *__restrict__ weights,
+                  const float (&halo)[kHaloSize][kHaloSize][kHaloSize][kInChannelsDiv],
+                  int li, int lj, int lk) {
+    using Taps = typename StencilT::Taps;
+    return sumDivergenceTapsImpl<StencilT>(
+        weights, halo, li, lj, lk,
+        std::make_index_sequence<std::tuple_size_v<Taps>>{});
+}
+
+// Gradient: each tap is a (out_c, di, dj, dk) triple. Accumulate per-output.
+template <typename StencilT, std::size_t... Is>
+__device__ __forceinline__ void
+sumGradientTapsImpl(const float *__restrict__ weights,
+                    const float (&halo)[kHaloSize][kHaloSize][kHaloSize],
+                    int li, int lj, int lk,
+                    float (&out)[kOutChannelsGrad],
+                    std::index_sequence<Is...>) {
+    using Taps                 = typename StencilT::Taps;
+    constexpr int kInC         = StencilT::kInChannels;
+    constexpr int kPerOcStride = kInC * 27;
+    ((out[std::tuple_element_t<Is, Taps>::oc] +=
+      weights[std::tuple_element_t<Is, Taps>::oc * kPerOcStride +
+              std::tuple_element_t<Is, Taps>::ic * 27 +
+              (std::tuple_element_t<Is, Taps>::di + 1) * 9 +
+              (std::tuple_element_t<Is, Taps>::dj + 1) * 3 +
+              (std::tuple_element_t<Is, Taps>::dk + 1)] *
+      halo[li + std::tuple_element_t<Is, Taps>::di + 1]
+          [lj + std::tuple_element_t<Is, Taps>::dj + 1]
+          [lk + std::tuple_element_t<Is, Taps>::dk + 1]),
+     ...);
+}
+
+template <typename StencilT>
+__device__ __forceinline__ void
+sumGradientTaps(const float *__restrict__ weights,
+                const float (&halo)[kHaloSize][kHaloSize][kHaloSize],
+                int li, int lj, int lk,
+                float (&out)[kOutChannelsGrad]) {
+    using Taps = typename StencilT::Taps;
+    sumGradientTapsImpl<StencilT>(
+        weights, halo, li, lj, lk, out,
+        std::make_index_sequence<std::tuple_size_v<Taps>>{});
+}
+
+template <typename StencilT>
+__global__ void
+divergenceConvKernel(const float *__restrict__ inputFeatures,    // [N_in, 3]
+                     const float *__restrict__ weights,           // [1, 3, 3, 3, 3]
+                     const nanovdb::NanoGrid<nanovdb::ValueOnIndex> *sourceGrid,
+                     const nanovdb::NanoGrid<nanovdb::ValueOnIndex> *targetGrid,
+                     float *__restrict__ outputFeatures) {        // [N_out, 1]
+    using SrcLeafT = nanovdb::NanoLeaf<nanovdb::ValueOnIndex>;
+
+    __shared__ float          haloValues[kHaloSize][kHaloSize][kHaloSize][kInChannelsDiv];
+    __shared__ const SrcLeafT *haloLeaves[3][3][3];
+
+    const int leafID = blockIdx.x;
+    const int tid    = threadIdx.x;
+
+    const auto &outLeaf    = targetGrid->tree().template getFirstNode<0>()[leafID];
+    const auto  leafOrigin = outLeaf.origin();
+    const int   Lx         = leafOrigin[0];
+    const int   Ly         = leafOrigin[1];
+    const int   Lz         = leafOrigin[2];
+
+    // Phase 0: 27-leaf probes.
+    const auto &srcTree = sourceGrid->tree();
+    if (tid < 27) {
+        const int li = tid / 9;
+        const int lj = (tid / 3) % 3;
+        const int lk = tid % 3;
+        const nanovdb::Coord leafOri(Lx + (li - 1) * kLeafSize,
+                                     Ly + (lj - 1) * kLeafSize,
+                                     Lz + (lk - 1) * kLeafSize);
+        haloLeaves[li][lj][lk] = srcTree.root().probeLeaf(leafOri);
+    }
+    __syncthreads();
+
+    // Phase 1: halo load with 3 features per slot.
+    #pragma unroll
+    for (int pass = 0; pass < 2; ++pass) {
+        const int s = tid + pass * kThreads;
+        if (s < kHaloVoxels) {
+            const int i = s / (kHaloSize * kHaloSize);
+            const int j = (s / kHaloSize) % kHaloSize;
+            const int k = s % kHaloSize;
+            const int gx = Lx - 1 + i;
+            const int gy = Ly - 1 + j;
+            const int gz = Lz - 1 + k;
+            const int leafI = (gx >> 3) - (Lx >> 3) + 1;
+            const int leafJ = (gy >> 3) - (Ly >> 3) + 1;
+            const int leafK = (gz >> 3) - (Lz >> 3) + 1;
+
+            const SrcLeafT *leaf = haloLeaves[leafI][leafJ][leafK];
+            float v0 = 0.0f, v1 = 0.0f, v2 = 0.0f;
+            if (leaf != nullptr) {
+                const uint32_t localOff = ((gx & 0x7) << 6) | ((gy & 0x7) << 3) | (gz & 0x7);
+                const uint64_t raw      = leaf->getValue(localOff);
+                if (raw) {
+                    const uint64_t base = (raw - 1) * kInChannelsDiv;
+                    v0 = inputFeatures[base + 0];
+                    v1 = inputFeatures[base + 1];
+                    v2 = inputFeatures[base + 2];
+                }
+            }
+            haloValues[i][j][k][0] = v0;
+            haloValues[i][j][k][1] = v1;
+            haloValues[i][j][k][2] = v2;
+        }
+    }
+    __syncthreads();
+
+    // Phase 2: scalar output via 6-tap divergence fold.
+    const int li = (tid >> 6) & 0x7;
+    const int lj = (tid >> 3) & 0x7;
+    const int lk = tid & 0x7;
+
+    const uint32_t outLocalOff = (li << 6) | (lj << 3) | lk;
+    const int64_t  outIdx      = static_cast<int64_t>(outLeaf.getValue(outLocalOff)) - 1;
+    if (outIdx < 0) {
+        return;
+    }
+
+    const float sum = sumDivergenceTaps<StencilT>(weights, haloValues, li, lj, lk);
+    outputFeatures[outIdx] = sum;  // out_c == 1
+}
+
+template <typename StencilT>
+__global__ void
+gradientConvKernel(const float *__restrict__ inputFeatures,      // [N_in, 1]
+                   const float *__restrict__ weights,             // [3, 1, 3, 3, 3]
+                   const nanovdb::NanoGrid<nanovdb::ValueOnIndex> *sourceGrid,
+                   const nanovdb::NanoGrid<nanovdb::ValueOnIndex> *targetGrid,
+                   float *__restrict__ outputFeatures) {          // [N_out, 3]
+    using SrcLeafT = nanovdb::NanoLeaf<nanovdb::ValueOnIndex>;
+
+    __shared__ float          haloValues[kHaloSize][kHaloSize][kHaloSize];
+    __shared__ const SrcLeafT *haloLeaves[3][3][3];
+
+    const int leafID = blockIdx.x;
+    const int tid    = threadIdx.x;
+
+    const auto &outLeaf    = targetGrid->tree().template getFirstNode<0>()[leafID];
+    const auto  leafOrigin = outLeaf.origin();
+    const int   Lx         = leafOrigin[0];
+    const int   Ly         = leafOrigin[1];
+    const int   Lz         = leafOrigin[2];
+
+    // Phase 0: 27-leaf probes.
+    const auto &srcTree = sourceGrid->tree();
+    if (tid < 27) {
+        const int li = tid / 9;
+        const int lj = (tid / 3) % 3;
+        const int lk = tid % 3;
+        const nanovdb::Coord leafOri(Lx + (li - 1) * kLeafSize,
+                                     Ly + (lj - 1) * kLeafSize,
+                                     Lz + (lk - 1) * kLeafSize);
+        haloLeaves[li][lj][lk] = srcTree.root().probeLeaf(leafOri);
+    }
+    __syncthreads();
+
+    // Phase 1: scalar halo load (1 feature per slot).
+    #pragma unroll
+    for (int pass = 0; pass < 2; ++pass) {
+        const int s = tid + pass * kThreads;
+        if (s < kHaloVoxels) {
+            const int i = s / (kHaloSize * kHaloSize);
+            const int j = (s / kHaloSize) % kHaloSize;
+            const int k = s % kHaloSize;
+            const int gx = Lx - 1 + i;
+            const int gy = Ly - 1 + j;
+            const int gz = Lz - 1 + k;
+            const int leafI = (gx >> 3) - (Lx >> 3) + 1;
+            const int leafJ = (gy >> 3) - (Ly >> 3) + 1;
+            const int leafK = (gz >> 3) - (Lz >> 3) + 1;
+
+            const SrcLeafT *leaf = haloLeaves[leafI][leafJ][leafK];
+            float           val  = 0.0f;
+            if (leaf != nullptr) {
+                const uint32_t localOff = ((gx & 0x7) << 6) | ((gy & 0x7) << 3) | (gz & 0x7);
+                const uint64_t raw      = leaf->getValue(localOff);
+                if (raw) {
+                    val = inputFeatures[raw - 1];
+                }
+            }
+            haloValues[i][j][k] = val;
+        }
+    }
+    __syncthreads();
+
+    // Phase 2: 3-channel output via 6-tap gradient fold (each tap
+    // contributes to a specific output channel).
+    const int li = (tid >> 6) & 0x7;
+    const int lj = (tid >> 3) & 0x7;
+    const int lk = tid & 0x7;
+
+    const uint32_t outLocalOff = (li << 6) | (lj << 3) | lk;
+    const int64_t  outIdx      = static_cast<int64_t>(outLeaf.getValue(outLocalOff)) - 1;
+    if (outIdx < 0) {
+        return;
+    }
+
+    float out[kOutChannelsGrad] = {0.0f, 0.0f, 0.0f};
+    sumGradientTaps<StencilT>(weights, haloValues, li, lj, lk, out);
+    const int64_t base = outIdx * kOutChannelsGrad;
+    outputFeatures[base + 0] = out[0];
+    outputFeatures[base + 1] = out[1];
+    outputFeatures[base + 2] = out[2];
+}
+
 } // namespace
+
+// Channel counts implied by each StencilKind.
+static inline int stencilInChannels(StencilKind k) {
+    switch (k) {
+    case StencilKind::Divergence:
+    case StencilKind::MacDivergence: return 3;
+    case StencilKind::Dense27:
+    case StencilKind::Laplace7:
+    case StencilKind::Gradient:
+    case StencilKind::MacGradient:   return 1;
+    }
+    return 1;
+}
+
+static inline int stencilOutChannels(StencilKind k) {
+    switch (k) {
+    case StencilKind::Gradient:
+    case StencilKind::MacGradient:   return 3;
+    case StencilKind::Dense27:
+    case StencilKind::Laplace7:
+    case StencilKind::Divergence:
+    case StencilKind::MacDivergence: return 1;
+    }
+    return 1;
+}
 
 torch::Tensor
 stencilSparseConv(const torch::Tensor &inputFeatures,
@@ -182,6 +474,9 @@ stencilSparseConv(const torch::Tensor &inputFeatures,
                   const GridBatchImpl &sourceGrid,
                   const GridBatchImpl &targetGrid,
                   StencilKind          kind) {
+    const int in_c  = stencilInChannels(kind);
+    const int out_c = stencilOutChannels(kind);
+
     TORCH_CHECK(inputFeatures.is_cuda(), "inputFeatures must be a CUDA tensor");
     TORCH_CHECK(weights.is_cuda(), "weights must be a CUDA tensor");
     TORCH_CHECK(inputFeatures.scalar_type() == torch::kFloat32,
@@ -194,16 +489,21 @@ stencilSparseConv(const torch::Tensor &inputFeatures,
                 "inputFeatures must be 1-D or 2-D, got ",
                 inputFeatures.dim(),
                 "-D");
-    if (inputFeatures.dim() == 2) {
-        TORCH_CHECK(inputFeatures.size(1) == 1,
-                    "StencilConv requires in_channels=1, got ",
-                    inputFeatures.size(1));
+    if (inputFeatures.dim() == 1) {
+        TORCH_CHECK(in_c == 1,
+                    "StencilConv kind ", static_cast<int>(kind),
+                    " requires in_channels=", in_c, " but got 1-D inputFeatures");
+    } else {
+        TORCH_CHECK(inputFeatures.size(1) == in_c,
+                    "StencilConv kind ", static_cast<int>(kind),
+                    " requires in_channels=", in_c, ", got ", inputFeatures.size(1));
     }
 
-    TORCH_CHECK(weights.dim() == 5, "weights must be 5-D [1,1,3,3,3]");
-    TORCH_CHECK(weights.size(0) == 1 && weights.size(1) == 1 && weights.size(2) == 3 &&
-                    weights.size(3) == 3 && weights.size(4) == 3,
-                "StencilConv requires weights shape [1,1,3,3,3], got [",
+    TORCH_CHECK(weights.dim() == 5,
+                "StencilConv weights must be 5-D [out_c, in_c, 3, 3, 3]");
+    TORCH_CHECK(weights.size(0) == out_c && weights.size(1) == in_c &&
+                    weights.size(2) == 3 && weights.size(3) == 3 && weights.size(4) == 3,
+                "StencilConv requires weights shape [", out_c, ",", in_c, ",3,3,3], got [",
                 weights.size(0), ",", weights.size(1), ",", weights.size(2), ",",
                 weights.size(3), ",", weights.size(4), "]");
 
@@ -228,7 +528,7 @@ stencilSparseConv(const torch::Tensor &inputFeatures,
                 ")");
 
     auto opts   = inputFeatures.options();
-    auto output = torch::zeros({N_out, 1}, opts);
+    auto output = torch::zeros({N_out, out_c}, opts);
 
     const uint32_t numTargetLeaves = targetGrid.numLeavesAt(0);
     if (numTargetLeaves == 0 || N_out == 0) {
@@ -256,6 +556,42 @@ stencilSparseConv(const torch::Tensor &inputFeatures,
         break;
     case StencilKind::Laplace7:
         stencilConvKernel<Laplace3DStencil>
+            <<<numTargetLeaves, kThreads, 0, stream>>>(
+                inputFeatures.data_ptr<float>(),
+                weights.data_ptr<float>(),
+                sourceNanoGrid,
+                targetNanoGrid,
+                output.data_ptr<float>());
+        break;
+    case StencilKind::Divergence:
+        divergenceConvKernel<Divergence3DStencil>
+            <<<numTargetLeaves, kThreads, 0, stream>>>(
+                inputFeatures.data_ptr<float>(),
+                weights.data_ptr<float>(),
+                sourceNanoGrid,
+                targetNanoGrid,
+                output.data_ptr<float>());
+        break;
+    case StencilKind::Gradient:
+        gradientConvKernel<Gradient3DStencil>
+            <<<numTargetLeaves, kThreads, 0, stream>>>(
+                inputFeatures.data_ptr<float>(),
+                weights.data_ptr<float>(),
+                sourceNanoGrid,
+                targetNanoGrid,
+                output.data_ptr<float>());
+        break;
+    case StencilKind::MacDivergence:
+        divergenceConvKernel<MacDivergence3DStencil>
+            <<<numTargetLeaves, kThreads, 0, stream>>>(
+                inputFeatures.data_ptr<float>(),
+                weights.data_ptr<float>(),
+                sourceNanoGrid,
+                targetNanoGrid,
+                output.data_ptr<float>());
+        break;
+    case StencilKind::MacGradient:
+        gradientConvKernel<MacGradient3DStencil>
             <<<numTargetLeaves, kThreads, 0, stream>>>(
                 inputFeatures.data_ptr<float>(),
                 weights.data_ptr<float>(),

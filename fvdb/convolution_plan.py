@@ -97,66 +97,158 @@ class _PredGatherIGemmConvFn(torch.autograd.Function):
 
 _STENCIL_KIND_DENSE27 = 0
 _STENCIL_KIND_LAPLACE7 = 1
+_STENCIL_KIND_DIVERGENCE = 2
+_STENCIL_KIND_GRADIENT = 3
+_STENCIL_KIND_MAC_DIVERGENCE = 4
+_STENCIL_KIND_MAC_GRADIENT = 5
 
 _STENCIL_KIND_BY_NAME: dict[str, int] = {
     "dense27": _STENCIL_KIND_DENSE27,
     "laplace7": _STENCIL_KIND_LAPLACE7,
+    "divergence": _STENCIL_KIND_DIVERGENCE,
+    "gradient": _STENCIL_KIND_GRADIENT,
+    "mac-divergence": _STENCIL_KIND_MAC_DIVERGENCE,
+    "mac-gradient": _STENCIL_KIND_MAC_GRADIENT,
 }
 
-# Weight-tensor positions used by each sparse stencil. Indexed into a
-# [1,1,3,3,3] tensor as weights[0, 0, di+1, dj+1, dk+1]. Dense27 uses every
-# position so it is not listed here.
-_LAPLACE7_ON_STENCIL_OFFSETS: tuple[tuple[int, int, int], ...] = (
-    (1, 1, 1),  # center
-    (0, 1, 1), (2, 1, 1),  # x-axis
-    (1, 0, 1), (1, 2, 1),  # y-axis
-    (1, 1, 0), (1, 1, 2),  # z-axis
+# Per-kind input/output channel counts.
+_STENCIL_CHANNELS_BY_KIND: dict[int, tuple[int, int]] = {
+    _STENCIL_KIND_DENSE27: (1, 1),
+    _STENCIL_KIND_LAPLACE7: (1, 1),
+    _STENCIL_KIND_DIVERGENCE: (3, 1),
+    _STENCIL_KIND_GRADIENT: (1, 3),
+    _STENCIL_KIND_MAC_DIVERGENCE: (3, 1),
+    _STENCIL_KIND_MAC_GRADIENT: (1, 3),
+}
+
+# On-stencil weight positions per kind. Each entry is a flat index into a
+# weights tensor of shape [out_c, in_c, 3, 3, 3] using row-major layout:
+#     flat = oc * (in_c * 27) + ic * 27 + di_idx * 9 + dj_idx * 3 + dk_idx
+# Kinds whose kernels read every position (e.g. Dense27) are omitted.
+
+def _flat_idx(oc: int, ic: int, di_idx: int, dj_idx: int, dk_idx: int, in_c: int) -> int:
+    return oc * (in_c * 27) + ic * 27 + di_idx * 9 + dj_idx * 3 + dk_idx
+
+
+_LAPLACE7_ON_STENCIL_FLAT: tuple[int, ...] = tuple(
+    _flat_idx(0, 0, i, j, k, in_c=1)
+    for (i, j, k) in (
+        (1, 1, 1),                   # center
+        (0, 1, 1), (2, 1, 1),        # x-axis
+        (1, 0, 1), (1, 2, 1),        # y-axis
+        (1, 1, 0), (1, 1, 2),        # z-axis
+    )
 )
 
-# Per-device cache of the 20-element flattened-index vector of off-stencil
-# weight positions, built lazily on first use. Reused across all validation
-# calls on that device so we don't pay `torch.zeros` + 7 scalar assignments
-# per forward pass.
-_LAPLACE7_OFF_STENCIL_INDEX: dict[torch.device, torch.Tensor] = {}
+# Divergence: weights[0, 0|1|2, di|dj|dk axis tap, ...] = ±0.5
+# 6 on-stencil positions across in_c ∈ {0,1,2}.
+_DIVERGENCE_ON_STENCIL_FLAT: tuple[int, ...] = (
+    _flat_idx(0, 0, 0, 1, 1, in_c=3),  # ∂Fx/∂x: ic=0, di=-1
+    _flat_idx(0, 0, 2, 1, 1, in_c=3),  # ∂Fx/∂x: ic=0, di=+1
+    _flat_idx(0, 1, 1, 0, 1, in_c=3),  # ∂Fy/∂y: ic=1, dj=-1
+    _flat_idx(0, 1, 1, 2, 1, in_c=3),  # ∂Fy/∂y: ic=1, dj=+1
+    _flat_idx(0, 2, 1, 1, 0, in_c=3),  # ∂Fz/∂z: ic=2, dk=-1
+    _flat_idx(0, 2, 1, 1, 2, in_c=3),  # ∂Fz/∂z: ic=2, dk=+1
+)
+
+# Gradient: each output channel uses one axis. 6 on-stencil positions across oc ∈ {0,1,2}.
+_GRADIENT_ON_STENCIL_FLAT: tuple[int, ...] = (
+    _flat_idx(0, 0, 0, 1, 1, in_c=1),  # ∂/∂x → out 0, di=-1
+    _flat_idx(0, 0, 2, 1, 1, in_c=1),
+    _flat_idx(1, 0, 1, 0, 1, in_c=1),  # ∂/∂y → out 1, dj=-1
+    _flat_idx(1, 0, 1, 2, 1, in_c=1),
+    _flat_idx(2, 0, 1, 1, 0, in_c=1),  # ∂/∂z → out 2, dk=-1
+    _flat_idx(2, 0, 1, 1, 2, in_c=1),
+)
+
+# MAC-grid divergence (forward differences): for each ic, taps at di=0 (center) and di=+1.
+# di_idx 1 = di=0, di_idx 2 = di=+1.
+_MAC_DIVERGENCE_ON_STENCIL_FLAT: tuple[int, ...] = (
+    _flat_idx(0, 0, 1, 1, 1, in_c=3),  # ic=0, di=0
+    _flat_idx(0, 0, 2, 1, 1, in_c=3),  # ic=0, di=+1
+    _flat_idx(0, 1, 1, 1, 1, in_c=3),  # ic=1, dj=0
+    _flat_idx(0, 1, 1, 2, 1, in_c=3),  # ic=1, dj=+1
+    _flat_idx(0, 2, 1, 1, 1, in_c=3),  # ic=2, dk=0
+    _flat_idx(0, 2, 1, 1, 2, in_c=3),  # ic=2, dk=+1
+)
+
+# MAC-grid gradient (backward differences): for each oc, taps at di=-1 and di=0.
+_MAC_GRADIENT_ON_STENCIL_FLAT: tuple[int, ...] = (
+    _flat_idx(0, 0, 0, 1, 1, in_c=1),  # oc=0, di=-1
+    _flat_idx(0, 0, 1, 1, 1, in_c=1),  # oc=0, di=0
+    _flat_idx(1, 0, 1, 0, 1, in_c=1),  # oc=1, dj=-1
+    _flat_idx(1, 0, 1, 1, 1, in_c=1),  # oc=1, dj=0
+    _flat_idx(2, 0, 1, 1, 0, in_c=1),  # oc=2, dk=-1
+    _flat_idx(2, 0, 1, 1, 1, in_c=1),  # oc=2, dk=0
+)
+
+# Per-kind tuple of (kind_name, total_weight_count, on_stencil_flat_indices).
+_OFF_STENCIL_VALIDATORS: dict[int, tuple[str, int, tuple[int, ...]]] = {
+    _STENCIL_KIND_LAPLACE7:        ("laplace7",       1 * 1 * 27, _LAPLACE7_ON_STENCIL_FLAT),
+    _STENCIL_KIND_DIVERGENCE:      ("divergence",     1 * 3 * 27, _DIVERGENCE_ON_STENCIL_FLAT),
+    _STENCIL_KIND_GRADIENT:        ("gradient",       3 * 1 * 27, _GRADIENT_ON_STENCIL_FLAT),
+    _STENCIL_KIND_MAC_DIVERGENCE:  ("mac-divergence", 1 * 3 * 27, _MAC_DIVERGENCE_ON_STENCIL_FLAT),
+    _STENCIL_KIND_MAC_GRADIENT:    ("mac-gradient",   3 * 1 * 27, _MAC_GRADIENT_ON_STENCIL_FLAT),
+}
+
+# Cached per-(device, kind) off-stencil index vector; computed once and reused
+# so per-execute validation is one small kernel launch + one device sync.
+_OFF_STENCIL_INDEX_CACHE: dict[tuple[torch.device, int], torch.Tensor] = {}
 
 
-def _laplace7_off_stencil_index(device: torch.device) -> torch.Tensor:
-    cached = _LAPLACE7_OFF_STENCIL_INDEX.get(device)
+def _off_stencil_index(device: torch.device, kind: int) -> torch.Tensor:
+    key = (device, kind)
+    cached = _OFF_STENCIL_INDEX_CACHE.get(key)
     if cached is not None:
         return cached
-    mask = torch.ones(27, dtype=torch.bool, device=device)
-    for i, j, k in _LAPLACE7_ON_STENCIL_OFFSETS:
-        mask[i * 9 + j * 3 + k] = False
+    _, total, on_flat = _OFF_STENCIL_VALIDATORS[kind]
+    mask = torch.ones(total, dtype=torch.bool, device=device)
+    for f in on_flat:
+        mask[f] = False
     idx = torch.nonzero(mask, as_tuple=False).squeeze(1).contiguous()
-    _LAPLACE7_OFF_STENCIL_INDEX[device] = idx
+    _OFF_STENCIL_INDEX_CACHE[key] = idx
     return idx
 
 
-def _validate_laplace7_weights(weights: torch.Tensor) -> None:
-    """Error if any off-stencil weight slot is nonzero.
+def _validate_sparse_stencil_weights(weights: torch.Tensor, kind: int) -> None:
+    """Error if any off-stencil weight slot is nonzero, for sparse stencils.
 
-    For the Laplace7 specialization the CUDA kernel only reads the 7 on-stencil
-    positions; any nonzero value written to the other 20 positions would be
-    silently dropped, giving a result that diverges from the dense 27-tap
-    reference. We reject such weight tensors up front so the failure is
-    loud and actionable.
+    For Laplace7 / Divergence / Gradient the CUDA kernel only reads a subset
+    of the 27 (or 3*27 / 3*27) weight positions; any nonzero value at the
+    other positions would be silently dropped, giving a result that diverges
+    from a dense convolution. Reject up front.
 
-    Uses a cached per-device index vector and a single fused reduction so
-    validation costs roughly one small kernel launch plus one device sync,
-    not a dozen launches per call.
+    Uses a cached per-(device, kind) index vector and a single fused
+    reduction so per-execute validation is one small kernel launch + one
+    device sync.
     """
-    idx = _laplace7_off_stencil_index(weights.device)
-    off = weights.view(-1).index_select(0, idx)
+    if kind not in _OFF_STENCIL_VALIDATORS:
+        return  # Dense27 reads everything, no validation needed.
+    name, total, _ = _OFF_STENCIL_VALIDATORS[kind]
+    flat = weights.reshape(-1)
+    if flat.numel() != total:
+        raise ValueError(
+            f"StencilConv {name} expects weight tensor with {total} elements, got "
+            f"{flat.numel()} (shape {tuple(weights.shape)})."
+        )
+    idx = _off_stencil_index(weights.device, kind)
+    off = flat.index_select(0, idx)
     max_abs = off.abs().amax().item()  # single D2H sync
     if max_abs != 0.0:
         raise ValueError(
-            "StencilConv laplace7 requires off-stencil weight positions to be "
+            f"StencilConv {name} requires off-stencil weight positions to be "
             f"exactly zero; max |off-stencil weight| = {max_abs:.3e}. "
-            "Either zero out the 20 non-Laplacian positions, or drop stencil='laplace7' "
-            "from expert_config to use the Dense27 path. "
+            f"Zero out the unused positions, or drop stencil='{name}' from "
+            "expert_config to use a denser path. "
             "If you want to skip this check for performance, pass "
             "expert_config={..., 'validate_weights': False}."
         )
+
+
+# Backwards-compatible alias used by tests written before the validator was
+# generalized over kinds.
+def _validate_laplace7_weights(weights: torch.Tensor) -> None:
+    _validate_sparse_stencil_weights(weights, _STENCIL_KIND_LAPLACE7)
 
 
 class _StencilConvFn(torch.autograd.Function):
@@ -780,13 +872,15 @@ class ConvolutionPlan:
             result = self._target_grid.jagged_like(out_tensor)
 
         elif isinstance(backend, _StencilConvBackend):
-            if in_c != 1 or out_c != 1:
+            expected_in_c, expected_out_c = _STENCIL_CHANNELS_BY_KIND[backend.stencil_kind]
+            if in_c != expected_in_c or out_c != expected_out_c:
                 raise ValueError(
-                    f"StencilConv backend requires in_channels=1 and out_channels=1, "
+                    f"StencilConv backend kind={backend.stencil_kind} requires "
+                    f"in_channels={expected_in_c} and out_channels={expected_out_c}, "
                     f"got ({in_c}, {out_c})."
                 )
-            if backend.stencil_kind == _STENCIL_KIND_LAPLACE7 and backend.validate_weights:
-                _validate_laplace7_weights(weights)
+            if backend.validate_weights:
+                _validate_sparse_stencil_weights(weights, backend.stencil_kind)
             out_tensor = _StencilConvFn.apply(
                 data.jdata,
                 weights,
@@ -920,7 +1014,11 @@ class ConvolutionPlan:
                 topo = _fvdb_cpp.gs_build_topology(source_grid._impl, target_grid._impl, kernel_size, stride)
             return _GatherScatterBackend(topology=topo)
 
-        # StencilConv — CTA-per-leaf scalar stencil (forward only, stride 1, R=1)
+        # StencilConv — CTA-per-leaf stencil (forward only, stride 1, R=1).
+        # Channel counts depend on the stencil kind:
+        #   dense27/laplace7  → in=1, out=1
+        #   divergence        → in=3, out=1
+        #   gradient          → in=1, out=3
         if backend_name == "stencil":
             if transposed:
                 raise ValueError("StencilConv backend does not support transposed convolution.")
@@ -928,21 +1026,24 @@ class ConvolutionPlan:
                 raise ValueError("StencilConv backend requires stride 1.")
             if not _vec_is_all(kernel_size, 3):
                 raise ValueError("StencilConv backend requires kernel_size 3x3x3.")
-            for cin, cout in channel_pairs:
-                if cin != 1 or cout != 1:
-                    raise ValueError(
-                        f"StencilConv backend requires in_channels=1 and out_channels=1, "
-                        f"got ({cin}, {cout})."
-                    )
             stencil_name = expert_config.get("stencil", "dense27")
             if stencil_name not in _STENCIL_KIND_BY_NAME:
                 raise ValueError(
                     f"StencilConv 'stencil' must be one of "
                     f"{sorted(_STENCIL_KIND_BY_NAME.keys())}, got {stencil_name!r}."
                 )
+            stencil_kind = _STENCIL_KIND_BY_NAME[stencil_name]
+            expected_in_c, expected_out_c = _STENCIL_CHANNELS_BY_KIND[stencil_kind]
+            for cin, cout in channel_pairs:
+                if cin != expected_in_c or cout != expected_out_c:
+                    raise ValueError(
+                        f"StencilConv stencil={stencil_name!r} requires in_channels="
+                        f"{expected_in_c} and out_channels={expected_out_c}, got "
+                        f"({cin}, {cout})."
+                    )
             validate_weights = bool(expert_config.get("validate_weights", True))
             return _StencilConvBackend(
-                stencil_kind=_STENCIL_KIND_BY_NAME[stencil_name],
+                stencil_kind=stencil_kind,
                 validate_weights=validate_weights,
             )
 

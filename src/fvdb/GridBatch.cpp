@@ -1216,9 +1216,10 @@ GridBatch::stencilConv(torch::Tensor features,
                        const GridBatch &source_grid,
                        const GridBatch &target_grid,
                        int64_t stencil_kind) {
-    TORCH_CHECK(stencil_kind == 0 || stencil_kind == 1,
-                "stencilConv: stencil_kind must be 0 (Dense27) or 1 (Laplace7), got ",
-                stencil_kind);
+    TORCH_CHECK(stencil_kind >= 0 && stencil_kind <= 5,
+                "stencilConv: stencil_kind must be 0 (Dense27), 1 (Laplace7), "
+                "2 (Divergence), 3 (Gradient), 4 (MacDivergence), or "
+                "5 (MacGradient), got ", stencil_kind);
     const auto kind = static_cast<detail::ops::StencilKind>(stencil_kind);
     return detail::ops::stencilSparseConv(
         features, weights, *source_grid.mImpl, *target_grid.mImpl, kind);

@@ -867,8 +867,12 @@ struct GridBatch : torch::CustomClassHolder {
     /// @param weights        Kernel weights, shape [1, 1, 3, 3, 3], float32.
     /// @param source_grid    Grid batch for input voxels.
     /// @param target_grid    Grid batch for output voxels.
-    /// @param stencil_kind   Compile-time stencil specialization: 0 = Dense27
-    ///                       (all 27 taps), 1 = Laplace7 (center + 6 face neighbors).
+    /// @param stencil_kind   Compile-time stencil specialization:
+    ///                         0 = Dense27    (in=1, out=1, all 27 taps)
+    ///                         1 = Laplace7   (in=1, out=1, center + 6 face neighbors)
+    ///                         2 = Divergence (in=3, out=1, central difference per axis)
+    ///                         3 = Gradient   (in=1, out=3, central difference per axis)
+    ///                       Weight tensor shape is [out_c, in_c, 3, 3, 3].
     /// @return Output features, shape [N_out, 1], float32.
     static torch::Tensor stencilConv(torch::Tensor features,
                                      torch::Tensor weights,
